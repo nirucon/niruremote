@@ -44,10 +44,12 @@ impl StateLock {
                     return Ok(Self { path, held: true });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if let Ok(metadata) = fs::metadata(&path)
-                        && let Ok(modified) = metadata.modified()
-                        && modified.elapsed().unwrap_or_default() > Duration::from_secs(30)
-                    {
+                    let stale = fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .is_ok_and(|modified| {
+                            modified.elapsed().unwrap_or_default() > Duration::from_secs(30)
+                        });
+                    if stale {
                         let _ = fs::remove_file(&path);
                         continue;
                     }

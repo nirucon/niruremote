@@ -17,27 +17,27 @@
    ```sh
    cp target/release/niruremote niruremote
    sha256sum niruremote > SHA256SUMS
-   gh release create v0.1.6 niruremote SHA256SUMS \
-     --title "NIRUREMOTE 0.1.6" \
+   gh release create v0.2.0 niruremote SHA256SUMS \
+     --title "NIRUREMOTE 0.2.0" \
      --notes "Linux/X11 host, SSH tunnel, Tailscale discovery, Windows/macOS clients."
    ```
 
    `install.sh` downloads exactly:
-   `https://github.com/nirucon/niruremote/releases/download/v0.1.6/niruremote`
+   `https://github.com/nirucon/niruremote/releases/download/v0.2.0/niruremote`
    and `SHA256SUMS`.
 
 5. Compute the source tag checksum used by NIRUX extras:
 
    ```sh
-   curl -fsSL -o /tmp/niruremote-v0.1.6.tar.gz \
-     https://github.com/nirucon/niruremote/archive/refs/tags/v0.1.6.tar.gz
-   sha256sum /tmp/niruremote-v0.1.6.tar.gz
+   curl -fsSL -o /tmp/niruremote-v0.2.0.tar.gz \
+     https://github.com/nirucon/niruremote/archive/refs/tags/v0.2.0.tar.gz
+   sha256sum /tmp/niruremote-v0.2.0.tar.gz
    ```
 
 6. Add the extras row in the NIRUX `nirux` script:
 
    ```text
-   niruremote niruremote 0.1.6 <checksum>
+   niruremote niruremote 0.2.0 <checksum>
    ```
 
    and the matching row in `nirux/docs/EXTRAS.md`.

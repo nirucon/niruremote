@@ -1,5 +1,6 @@
 mod agent;
 mod client;
+mod events;
 mod json;
 mod session;
 mod ssh;
@@ -56,7 +57,8 @@ fn run() -> Result<(), String> {
         }
         "enable" => agent::enable(),
         "disable" => agent::disable(),
-        "ensure" => agent::ensure(has_flag(&rest, "--hold"), has_flag(&rest, "--json")),
+        "ensure" => agent::ensure(has_flag(&rest, "--json")),
+        "stream" => agent::stream(),
         "peers" => {
             let response = client::peers(has_flag(&rest, "--refresh"), timeout_from(&rest, 3)?)?;
             if has_flag(&rest, "--json") {
@@ -147,9 +149,10 @@ USAGE:
 AGENT (run on the machine that is shared):
     probe [--json]              Inspect the local X11 session and x11vnc
     status [--json]             Alias for probe
-    enable                      Allow connections until disable/logout/reboot
-    disable                     Stop the local x11vnc backend
-    ensure [--json] [--hold]    Start/reuse the backend (used by connect)
+    enable                      Password-protected loopback listener for manual
+                                Windows/macOS tunnels (until disable/logout)
+    disable                     Stop the listener and end every remote session
+    stream                      Serve one session on stdin/stdout (used by connect)
     setup [--run]               Check/install x11vnc and a VNC viewer
     doctor                      Print diagnostics
 
@@ -170,8 +173,9 @@ EXAMPLES:
     niruremote connect desktop
     niruremote connect laptop --print
 
-The default Linux path binds x11vnc to 127.0.0.1 and reaches it through an
-authenticated SSH tunnel. No new Tailscale port is opened.",
+A Linux connection runs x11vnc in -inetd mode on the SSH channel itself: no
+port is opened on the host, the tailnet or the LAN, and the session ends with
+the channel. Screen locks are never bypassed.",
         version = env!("CARGO_PKG_VERSION")
     );
 }

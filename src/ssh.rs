@@ -1,12 +1,9 @@
-use crate::json::{EnsureResponse, LocalState, SCHEMA};
-use crate::util::{
-    configure_child, ensure_private_dir, now_secs, port_open_local, read_tail, run_capped,
-    state_dir, terminate_pid,
-};
+use crate::json::{LocalState, SCHEMA};
+use crate::util::{ensure_private_dir, now_secs, read_tail, run_capped, runtime_dir};
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct SshError {
@@ -27,22 +24,68 @@ fn ssh_bin() -> String {
     std::env::var("NIRUREMOTE_SSH").unwrap_or_else(|_| "ssh".into())
 }
 
-fn common_args(timeout: Duration) -> Vec<String> {
-    vec![
-        "-T".into(),
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
+/// Options for every SSH connection NIRUREMOTE makes.
+///
+/// - `BatchMode` never prompts; `StrictHostKeyChecking=yes` fails closed on an
+///   unknown or changed host key.
+/// - `ClearAllForwardings`, `ForwardAgent=no`, `ForwardX11=no` and
+///   `PermitLocalCommand=no` keep a user `~/.ssh/config` from adding
+///   listeners, agent or X11 access to these automated connections.
+/// - `ControlMaster=no`/`ControlPath=none` keep the session's lifetime equal
+///   to this process: no multiplexed master lingers after a disconnect.
+fn common_args(timeout: Duration, alive_interval: u32, alive_count: u32) -> Vec<String> {
+    let mut args = vec!["-T".to_string()];
+    for option in [
+        "BatchMode=yes".to_string(),
         format!("ConnectTimeout={}", timeout.as_secs().max(1)),
-        "-o".into(),
-        "ServerAliveInterval=2".into(),
-        "-o".into(),
-        "ServerAliveCountMax=2".into(),
-        "-o".into(),
-        "StrictHostKeyChecking=yes".into(),
-        "-o".into(),
-        "LogLevel=ERROR".into(),
-    ]
+        format!("ServerAliveInterval={alive_interval}"),
+        format!("ServerAliveCountMax={alive_count}"),
+        "StrictHostKeyChecking=yes".to_string(),
+        "ClearAllForwardings=yes".to_string(),
+        "ForwardAgent=no".to_string(),
+        "ForwardX11=no".to_string(),
+        "PermitLocalCommand=no".to_string(),
+        "ControlMaster=no".to_string(),
+        "ControlPath=none".to_string(),
+        "EscapeChar=none".to_string(),
+        "RemoteCommand=none".to_string(),
+        "LogLevel=ERROR".to_string(),
+    ] {
+        args.push("-o".into());
+        args.push(option);
+    }
+    args
+}
+
+/// The full argument list for a fixed remote command. The host is validated
+/// and placed after `--`; the remote command is constant, never built from
+/// host names, user names or tailnet data.
+fn command_args(
+    host: &str,
+    timeout: Duration,
+    interval: u32,
+    count: u32,
+    remote: &[&str],
+) -> Vec<String> {
+    let mut args = common_args(timeout, interval, count);
+    args.push("--".into());
+    args.push(host.to_string());
+    args.extend(remote.iter().map(|part| part.to_string()));
+    args
+}
+
+pub const REMOTE_PROBE: &[&str] = &["niruremote", "probe", "--json"];
+pub const REMOTE_STREAM: &[&str] = &["niruremote", "stream"];
+
+/// `ssh HOST niruremote stream`: the remote desktop travels over this SSH
+/// channel's stdin/stdout. Keepalives end it within ~15 s of a dead path.
+pub fn stream_command(host: &str, timeout: Duration) -> Result<Command, SshError> {
+    if !crate::util::is_valid_host(host) {
+        return Err(SshError::new("invalid-host", "invalid SSH host name"));
+    }
+    let mut command = Command::new(ssh_bin());
+    command.args(command_args(host, timeout, 5, 3, REMOTE_STREAM));
+    Ok(command)
 }
 
 pub fn probe(host: &str, timeout: Duration) -> Result<LocalState, SshError> {
@@ -50,11 +93,7 @@ pub fn probe(host: &str, timeout: Duration) -> Result<LocalState, SshError> {
         return Err(SshError::new("invalid-host", "invalid SSH host name"));
     }
     let binary = ssh_bin();
-    let mut args = common_args(timeout);
-    args.push(host.to_string());
-    args.push("niruremote".into());
-    args.push("probe".into());
-    args.push("--json".into());
+    let args = command_args(host, timeout, 2, 2, REMOTE_PROBE);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run_capped(&binary, &refs, timeout + Duration::from_secs(3), 256 * 1024).map_err(
         |error| SshError::new("ssh-unavailable", format!("ssh is not available: {error}")),
@@ -128,35 +167,23 @@ fn classify_ssh_failure(output: &crate::util::CappedOutput) -> SshError {
     }
 }
 
-struct TempFiles {
+/// A private directory holding the stderr of an SSH child, removed on drop.
+pub struct TempFiles {
     dir: PathBuf,
-    stdout: PathBuf,
     stderr: PathBuf,
 }
 
 impl TempFiles {
-    fn new(prefix: &str) -> Result<Self, String> {
-        let dir = state_dir().join(format!("{prefix}-{}-{}", std::process::id(), now_secs()));
+    pub fn new(prefix: &str) -> Result<Self, String> {
+        let dir = runtime_dir().join(format!("{prefix}-{}-{}", std::process::id(), now_secs()));
         ensure_private_dir(&dir).map_err(|error| format!("temp directory: {error}"))?;
         Ok(Self {
-            stdout: dir.join("stdout"),
             stderr: dir.join("stderr"),
             dir,
         })
     }
 
-    fn open_stdout(&self) -> Result<fs::File, String> {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.stdout)
-            .map_err(|error| format!("temp stdout: {error}"))?;
-        set_private(&self.stdout)?;
-        Ok(file)
-    }
-
-    fn open_stderr(&self) -> Result<fs::File, String> {
+    pub fn open_stderr(&self) -> Result<fs::File, String> {
         let file = fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -167,11 +194,7 @@ impl TempFiles {
         Ok(file)
     }
 
-    fn read_stdout(&self) -> String {
-        fs::read_to_string(&self.stdout).unwrap_or_default()
-    }
-
-    fn read_stderr(&self) -> String {
+    pub fn read_stderr(&self) -> String {
         read_tail(&self.stderr, 8192).unwrap_or_default()
     }
 }
@@ -188,209 +211,60 @@ fn set_private(path: &std::path::Path) -> Result<(), String> {
         .map_err(|error| format!("permissions {}: {error}", path.display()))
 }
 
-pub struct RemoteSession {
-    pub response: EnsureResponse,
-    child: Child,
-    stdin: Option<ChildStdin>,
-    _files: TempFiles,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Drop for RemoteSession {
-    fn drop(&mut self) {
-        drop(self.stdin.take());
-        terminate_pid(self.child.id(), Duration::from_secs(1));
-        let _ = self.child.wait();
+    #[test]
+    fn host_key_checking_is_strict_and_forwardings_are_cleared() {
+        let args = command_args(
+            "desktop.example.ts.net",
+            Duration::from_secs(3),
+            5,
+            3,
+            REMOTE_STREAM,
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("StrictHostKeyChecking=yes"));
+        assert!(!joined.to_lowercase().contains("stricthostkeychecking=no"));
+        assert!(!joined.contains("accept-new"));
+        assert!(!joined.contains("UserKnownHostsFile"));
+        assert!(joined.contains("BatchMode=yes"));
+        assert!(joined.contains("ClearAllForwardings=yes"));
+        assert!(joined.contains("ForwardAgent=no"));
+        assert!(joined.contains("ControlPath=none"));
+        assert!(
+            !args
+                .iter()
+                .any(|argument| argument == "-L" || argument == "-R" || argument == "-D")
+        );
     }
-}
 
-pub fn ensure_remote(host: &str, timeout: Duration) -> Result<RemoteSession, SshError> {
-    if !crate::util::is_valid_host(host) {
-        return Err(SshError::new("invalid-host", "invalid SSH host name"));
+    #[test]
+    fn remote_command_is_fixed_and_after_the_host() {
+        let args = command_args("beta", Duration::from_secs(3), 5, 3, REMOTE_STREAM);
+        let separator = args.iter().position(|argument| argument == "--").unwrap();
+        assert_eq!(args[separator + 1], "beta");
+        assert_eq!(&args[separator + 2..], ["niruremote", "stream"]);
+        let probe = command_args("beta", Duration::from_secs(3), 2, 2, REMOTE_PROBE);
+        assert_eq!(probe.last().map(String::as_str), Some("--json"));
     }
-    let binary = ssh_bin();
-    let mut args = common_args(timeout);
-    args.push(host.to_string());
-    args.push("niruremote".into());
-    args.push("ensure".into());
-    args.push("--json".into());
-    args.push("--hold".into());
-    let mut command = Command::new(binary);
-    command.args(&args);
-    spawn_ensure(command, timeout + Duration::from_secs(3))
-}
 
-pub fn ensure_local(timeout: Duration) -> Result<RemoteSession, SshError> {
-    let binary = std::env::current_exe()
-        .map_err(|error| SshError::new("local-error", format!("current executable: {error}")))?;
-    let mut command = Command::new(binary);
-    command.args(["ensure", "--json", "--hold"]);
-    spawn_ensure(command, timeout + Duration::from_secs(3))
-}
-
-fn spawn_ensure(mut command: Command, timeout: Duration) -> Result<RemoteSession, SshError> {
-    let files = TempFiles::new("ensure").map_err(|error| SshError::new("local-error", error))?;
-    let stdout = files
-        .open_stdout()
-        .map_err(|error| SshError::new("local-error", error))?;
-    let stderr = files
-        .open_stderr()
-        .map_err(|error| SshError::new("local-error", error))?;
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    configure_child(&mut command, false, true);
-
-    let mut child = command.spawn().map_err(|error| {
-        SshError::new("ssh-unavailable", format!("could not start SSH: {error}"))
-    })?;
-    let stdin = child.stdin.take();
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        let stdout = files.read_stdout();
-        if let Some(line) = stdout.lines().find(|line| !line.trim().is_empty()) {
-            match serde_json::from_str::<EnsureResponse>(line.trim()) {
-                Ok(response) => {
-                    if response.local.state != "ready" {
-                        let detail = response
-                            .local
-                            .last_error
-                            .clone()
-                            .unwrap_or_else(|| "remote agent is not ready".into());
-                        let state = response.local.state.clone();
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(SshError::new(&state, detail));
-                    }
-                    if response.local.schema != SCHEMA {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(SshError::new(
-                            "protocol-error",
-                            format!("unsupported agent schema {}", response.local.schema),
-                        ));
-                    }
-                    return Ok(RemoteSession {
-                        response,
-                        child,
-                        stdin,
-                        _files: files,
-                    });
-                }
-                Err(_) => {
-                    if stdout.contains('}') {
-                        let detail = format!(
-                            "invalid ensure response: {}",
-                            stdout.lines().next().unwrap_or_default()
-                        );
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(SshError::new("protocol-error", detail));
-                    }
-                }
-            }
+    #[test]
+    fn hostile_host_names_are_refused() {
+        for host in [
+            "-oProxyCommand=x",
+            "a;b",
+            "a b",
+            "$(id)",
+            "a`id`",
+            "a\nb",
+            "",
+        ] {
+            assert!(
+                stream_command(host, Duration::from_secs(1)).is_err(),
+                "{host:?}"
+            );
         }
-
-        if let Ok(Some(status)) = child.try_wait() {
-            let stderr = files.read_stderr();
-            let detail = if stderr.is_empty() {
-                format!("remote ensure command exited with {status}")
-            } else {
-                stderr
-            };
-            return Err(SshError::new("agent-error", detail));
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let stderr = files.read_stderr();
-            return Err(SshError::new(
-                "ssh-timeout",
-                if stderr.is_empty() {
-                    "timed out waiting for the remote agent".into()
-                } else {
-                    stderr
-                },
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-pub struct Tunnel {
-    child: Child,
-    _files: TempFiles,
-}
-
-impl Drop for Tunnel {
-    fn drop(&mut self) {
-        terminate_pid(self.child.id(), Duration::from_secs(1));
-        let _ = self.child.wait();
-    }
-}
-
-pub fn tunnel(host: &str, local_port: u16, remote_port: u16) -> Result<Tunnel, String> {
-    if !crate::util::is_valid_host(host) {
-        return Err("invalid SSH host name".into());
-    }
-    let files = TempFiles::new("tunnel")?;
-    let stderr = files.open_stderr()?;
-    let mut command = Command::new(ssh_bin());
-    command
-        .arg("-T")
-        .arg("-N")
-        .arg("-L")
-        .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"))
-        .arg("-o")
-        .arg("ExitOnForwardFailure=yes")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=5")
-        .arg("-o")
-        .arg("ServerAliveInterval=5")
-        .arg("-o")
-        .arg("ServerAliveCountMax=2")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=yes")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
-        .arg(host)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr));
-    configure_child(&mut command, false, true);
-
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("could not start SSH tunnel: {error}"))?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            let detail = files.read_stderr();
-            return Err(if detail.is_empty() {
-                format!("SSH tunnel exited with {status}")
-            } else {
-                format!("SSH tunnel exited with {status}: {detail}")
-            });
-        }
-        if port_open_local(local_port, Duration::from_millis(200)) {
-            return Ok(Tunnel {
-                child,
-                _files: files,
-            });
-        }
-        if Instant::now() >= deadline {
-            terminate_pid(child.id(), Duration::from_secs(1));
-            let _ = child.wait();
-            let detail = files.read_stderr();
-            return Err(if detail.is_empty() {
-                "SSH tunnel did not become ready".into()
-            } else {
-                format!("SSH tunnel did not become ready: {detail}")
-            });
-        }
-        std::thread::sleep(Duration::from_millis(50));
     }
 }

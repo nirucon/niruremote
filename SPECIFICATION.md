@@ -1,6 +1,6 @@
 # NIRUREMOTE specification
 
-This document is the behavior contract for 0.1.x. UI labels and exact CLI
+This document is the behavior contract for 0.2.x. UI labels and exact CLI
 arguments may evolve, but the safety and truthfulness rules must not.
 
 ## 1. Scope
@@ -10,15 +10,17 @@ Deliver:
 1. Tailscale peer discovery on the client, including offline peers and OS.
 2. A read-only remote capability probe that distinguishes installed, inactive,
    ready, missing backend, no X11 session, Wayland, SSH failure and unknown.
-3. A Linux/X11 host agent that starts x11vnc on loopback and stops cleanly.
-4. An SSH-tunneled graphical connection from the client.
+3. A Linux/X11 host agent that serves x11vnc over the SSH channel itself
+   (`stream`, no listening port) and stops cleanly.
+4. An SSH-carried graphical connection from the client.
 5. Client-only RDP/VNC paths for Windows and macOS targets.
-6. Explicit `enable`/`disable` and temporary `connect`.
+6. Temporary `connect`, plus an explicit password-protected `enable` listener
+   for manual Windows/macOS tunnels, and `disable`.
 7. Machine-readable JSON for NIRULAUNCHER and future NIRUBAR integration.
 8. A peer cache with timestamps and bounded parallel refresh.
 9. Install, diagnostics, documentation and local smoke tests.
 
-Not in 0.1.x:
+Not in 0.2.x:
 
 - Wayland host capture.
 - Audio, file transfer, printer/USB redirection, multi-monitor selection.
@@ -97,16 +99,18 @@ The probe response contains:
 
 | State | Contract |
 |---|---|
-| `ready` | x11vnc is running and its loopback port is open |
+| `ready` | the `enable` listener is running and its loopback port is open |
 | `starting` | a PID exists but the port is not open yet |
-| `inactive` | X11 session and backend exist; nothing is running |
+| `inactive` | X11 session and backend exist; no `enable` listener (connect still works) |
 | `backend-missing` | X11 session exists, x11vnc is absent |
 | `no-session` | no active X11 session for this user |
 | `unsupported-wayland` | a Wayland session was found |
 | `error` | unexpected failure; `last_error` explains |
 
 `enabled` means a runtime state record exists. `running` means the loopback port
-is actually open. An offline/stale PID must be cleaned up, not displayed as
+is actually open (read from `/proc/net/tcp`; the probe never connects to it).
+`supported_modes` contains `ssh-stdio` when `connect` can be served.
+`locker` names a running screen locker; `sessions` counts live `stream`s. An offline/stale PID must be cleaned up, not displayed as
 ready.
 
 ## 5. Session discovery
@@ -124,56 +128,65 @@ The Xauthority candidates are `NIRUREMOTE_XAUTHORITY`, `XAUTHORITY`,
 
 ## 6. Host agent lifecycle
 
+### `stream` (the `connect` path, 0.2.0+)
+
+- Run by the client as the fixed remote command `niruremote stream`.
+- Refuses without an X11 session or x11vnc (message on stderr, exit 1).
+- Starts `x11vnc -inetd` on one end of a socketpair: **no TCP or Unix
+  listener exists**. `-rfbport 0 -noipv6 -nocmds -noremote -norc -ping 5`.
+- Relays bytes between its stdin/stdout (the SSH channel) and x11vnc.
+- Ends the session, stops x11vnc and removes its record when: the viewer side
+  reaches EOF, x11vnc exits, SIGINT/SIGTERM/SIGHUP arrive, or no byte has come
+  from the viewer for 30 s (x11vnc pings every 5 s, so a live viewer always
+  answers; this catches a silently dropped network path).
+- x11vnc has `PR_SET_PDEATHSIG`, so killing the agent kills it too.
+- Records itself in `$XDG_RUNTIME_DIR/niruremote/session-PID.json` and sends a
+  desktop notification at start and end (best effort).
+
 ### `enable`
 
-- Acquires the state lock.
-- Refuses to start without an X11 session or x11vnc.
-- Chooses a free loopback port.
-- Starts x11vnc detached, with stdout/stderr in a private log.
-- Writes runtime state (`pid`, `port`, `display`, `auth_file`, `started_at`,
-  `owner=enable`).
-- Does not survive logout/reboot in 0.1.x.
+- Acquires the state lock; refuses without an X11 session or x11vnc.
+- Chooses a free loopback port, generates an 8-character random VNC password,
+  writes it to a 0600 file and passes `-passwdfile rm:FILE` (x11vnc reads and
+  deletes it). The password is printed once to the terminal; never in argv,
+  JSON or logs.
+- x11vnc: `-localhost -rfbport PORT -rfbportv6 -1 -noipv6 -forever
+  -nevershared -dontdisconnect`. Only `127.0.0.1:PORT` listens.
+- Writes runtime state (`owner=enable`). Does not survive logout/reboot.
 
 ### `disable`
 
-- Acquires the state lock.
-- Sends SIGTERM and then SIGKILL after a grace period.
-- Removes runtime state.
+- Acquires the state lock, stops the `enable` listener (SIGTERM, then SIGKILL)
+  and ends every live `stream` session.
 - Never removes the log or peer cache.
 
-### `ensure --json --hold`
+### `ensure`
 
-- Reuses an existing listener and returns `owned=false`.
-- Otherwise starts x11vnc as a held child with `PR_SET_PDEATHSIG`.
-- Prints exactly one compact JSON line to stdout.
-- Waits while stdin is open. On stdin EOF or child exit, stops x11vnc and
-  removes state.
-- This is the temporary connection path used by `connect`; it leaves nothing
-  behind after the SSH channel closes.
-
-### `ensure --json` without `--hold`
-
-- Starts or reuses a detached listener and returns. It is for scripted setup;
-  `connect` uses `--hold`.
+- Kept only to answer 0.1.x clients: returns `state: upgrade-required` and
+  exits 1. 0.2.0 never starts an unauthenticated listener.
 
 ## 7. Connection flow (Linux/X11)
 
 1. Resolve the peer by Tailscale host, short name, DNS name or IP.
 2. Probe the remote agent. Refuse with a specific error for `backend-missing`,
-   `no-session`, `unsupported-wayland`, `host-key-untrusted`, `ssh-denied` and
-   `not-installed`.
-3. Run `ensure --json --hold` over SSH and read one JSON line.
-4. Allocate a local loopback port and open `ssh -N -L`.
-5. Start the best available viewer:
-   - TigerVNC: `vncviewer -SecurityTypes None -Shared 127.0.0.1::PORT`
-   - Remmina: `remmina -c vnc://127.0.0.1:PORT`
-6. Wait for the viewer. On viewer exit, Ctrl+C, SIGTERM or SIGHUP, close the
-   tunnel and the ensure channel. PDEATHSIG and stdin EOF are the two cleanup
-   mechanisms.
+   `no-session`, `unsupported-wayland`, `host-key-untrusted`, `ssh-denied`,
+   `not-installed`, and for agents older than 0.2.0 (`update-needed`).
+3. If the probe reports a screen locker, say so: the viewer will show the lock
+   screen and only the account password unlocks it.
+4. Bind a private endpoint for the viewer: a Unix socket
+   `$XDG_RUNTIME_DIR/niruremote/view-PID.sock` (0600 in a 0700 directory) for
+   TigerVNC, or a loopback TCP port for Remmina/old viewers. It accepts exactly
+   one connection, verifies the peer uid (`SO_PEERCRED` or `/proc/net/tcp`),
+   then closes and unlinks the listener.
+5. Start `ssh … -- HOST niruremote stream` with that connection as its stdin
+   and stdout. `connect` itself copies no bytes.
+6. Wait (blocking, no polling) for the viewer to exit, the SSH child to exit,
+   or SIGINT/SIGTERM/SIGHUP; then stop the other side. PDEATHSIG covers SIGKILL
+   of `connect`; SSH keepalives (5 s × 3) end a dead path on the client side.
 7. No orphan ssh, x11vnc or viewer process may remain.
 
-If the peer is the local machine, skip SSH and the tunnel; start the local agent
-and point the viewer at `127.0.0.1:PORT`.
+If the peer is the local machine, run `niruremote stream` locally instead of
+SSH.
 
 ## 8. Windows and macOS
 
@@ -207,27 +220,38 @@ macOS:
 
 ## 10. Security requirements
 
-- x11vnc runs as the session user, binds `127.0.0.1`, uses `-nopw` only because
-  the SSH tunnel is the authentication boundary, and never runs as root.
+- x11vnc runs as the session user and never as root. For `connect` it has no
+  listening socket at all (`-inetd` over the authenticated SSH channel); the
+  `enable` listener binds `127.0.0.1` only and requires a per-enable password.
 - SSH host keys fail closed.
 - No public listener, no Funnel, no ACL changes, no firewall changes.
-- No secret in argv, logs or JSON. The current design does not use a VNC
-  password; a future per-session password must not appear in argv.
+- No secret in argv, logs or JSON. The `enable` password reaches x11vnc via a
+  0600 `rm:` file and is printed only to the terminal that ran `enable`.
+- SSH runs with `ClearAllForwardings`, `ForwardAgent=no`, `ForwardX11=no`,
+  `ControlPath=none`, `RemoteCommand=none` so user configuration cannot add
+  listeners or keep a session alive.
+- Text from the tailnet or a remote agent is stripped of control characters
+  before it is printed.
+- The lock screen is never bypassed or unlocked; viewer input reaches the
+  locker like local input.
 - The local user must be able to see that a remote session is possible
   (`enabled`) and active (`ready`). A NIRUBAR indicator is planned.
 - `setup --run` is explicit and visible. No `curl | sh` bootstrap.
 
-## 11. Acceptance for 0.1.6
+## 11. Acceptance for 0.2.0
 
 - Unit tests for Tailscale parsing, RFC3339 parsing, host validation and
   distribution hints.
-- Local smoke test with fake x11vnc/SSH/viewer covering enable, probe, ensure,
-  disable, connect and cleanup.
+- Local smoke test with fake x11vnc/SSH/viewer covering enable (password file),
+  probe, ensure refusal, connect, idle watchdog, kill -9 and disable.
 - On bare metal, two NIRUX/X11 machines:
   - `probe` finds `:0` and the right Xauthority;
-  - `enable` listens only on `127.0.0.1`;
+  - `connect` creates no listener on either end; `enable` listens only on
+    `127.0.0.1` and refuses unauthenticated viewers;
   - `connect` shows the real desktop;
-  - closing the viewer or Ctrl+C leaves no x11vnc/ssh process;
+  - closing the viewer, Ctrl+C, kill -9 of the client or a dropped path
+    leaves no x11vnc/ssh process;
+  - a locked screen stays locked;
   - `disable` stops the listener;
   - an untrusted host key fails closed;
   - an offline peer shows `offline`;

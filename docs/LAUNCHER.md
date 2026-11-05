@@ -16,7 +16,7 @@ Recommended machine list:
 ☰ Tailscale · Remote desktop                         r refresh
 ──────────────────────────────────────────────────────────────
 ● desktop    linux    100.x.x.x   ready       VNC :0 · temporary
-● laptop     linux    100.x.x.x   inactive    agent installed · off
+● laptop     linux    100.x.x.x   ready       X11 :0 · connect any time
 ● winhost      windows  100.x.x.x   client-ready RDP reachable
 ○ machost      macOS    100.x.x.x   offline      last known client-ready (14m)
 ○ server       linux    100.x.x.x   no-session   no X11 desktop
@@ -57,9 +57,9 @@ Relevant fields:
       "ssh": {"state": "ok", "detail": "SSH reachable"},
       "remote": {
         "state": "ready",
-        "detail": "VNC :0 · 127.0.0.1:43123 · temporary",
-        "mode": "ssh-tunnel",
-        "version": "0.1.6",
+        "detail": "X11 :0 · connect any time · screen locked (nirulock)",
+        "mode": "ssh-stdio",
+        "version": "0.2.0",
         "checked_at": 1793656428
       }
     }
@@ -76,7 +76,8 @@ Enter on a row:
 
 | State | Enter |
 |---|---|
-| `ready`, `inactive` | Connect |
+| `ready` | Connect |
+| `update-needed` | Details (update NIRUREMOTE on that machine) |
 | `client-ready` | Connect (RDP or VNC) |
 | `starting` | Check again |
 | `offline` | Details |
@@ -138,7 +139,7 @@ honest and fast; it avoids a frozen launcher.
 Add a row to the NIRUX extras table once a tagged release exists:
 
 ```text
-niruremote niruremote 0.1.6 <sha256-of-v0.1.6.tar.gz>
+niruremote niruremote 0.2.0 <sha256-of-v0.2.0.tar.gz>
 ```
 
 The extras installer downloads the GitHub tag archive, verifies the checksum and
@@ -146,4 +147,4 @@ runs `install.sh`. `install.sh` installs the binary; it does not install x11vnc
 or a viewer. `niruremote setup --run` is the visible follow-up.
 
 NIRUX extras reads the installed version from the last field of
-`niruremote --version`, which is `0.1.6`.
+`niruremote --version`, which is `0.2.0`.

@@ -1,6 +1,6 @@
 use crate::json::SessionInfo;
 use crate::util::{
-    configure_child, ensure_private_dir, find_in_path, port_open_local, read_tail, run_capped,
+    configure_child, ensure_private_dir, find_in_path, read_tail, run_capped, tcp_listening_local,
     terminate_pid,
 };
 use std::fs;
@@ -8,17 +8,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StartMode {
-    Detached,
-    Held,
-}
-
-pub struct Started {
-    pub pid: u32,
-    pub child: Option<Child>,
-}
 
 pub fn binary() -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var("NIRUREMOTE_X11VNC") {
@@ -80,17 +69,87 @@ fn hint_for(id: &str, like: &str) -> &'static str {
     }
 }
 
-pub fn start(
-    session: &SessionInfo,
+/// Options shared by every x11vnc we start.
+///
+/// `-norc` ignores ~/.x11vncrc, `-nocmds` stops x11vnc from running external
+/// commands, `-noremote` ignores X11VNC_REMOTE control properties and
+/// `-noipv6` keeps it from opening its default `[::1]:5900` listener.
+fn base_args(display: &str, desktop: &str, auth: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-norc",
+        "-display",
+        display,
+        "-nocmds",
+        "-noremote",
+        "-noipv6",
+        "-noxdamage",
+        "-repeat",
+        "-quiet",
+        "-desktop",
+        desktop,
+    ]
+    .iter()
+    .map(|argument| argument.to_string())
+    .collect();
+    if let Some(auth) = auth {
+        args.push("-auth".into());
+        args.push(auth.into());
+    }
+    args
+}
+
+/// x11vnc for one `connect`: RFB over stdin/stdout, no listening socket.
+/// `-inetd` serves exactly one viewer and exits when its stream closes.
+/// `-ping` sends a 1x1 update every few seconds so the viewer keeps answering;
+/// the agent uses that traffic to notice a dead network path.
+pub fn stream_args(display: &str, desktop: &str, auth: Option<&str>) -> Vec<String> {
+    let mut args = base_args(display, desktop, auth);
+    args.extend(
+        ["-inetd", "-nopw", "-rfbport", "0", "-ping", "5"]
+            .iter()
+            .map(|argument| argument.to_string()),
+    );
+    args
+}
+
+/// x11vnc for `enable`: a loopback-only listener protected by a per-enable
+/// VNC password that x11vnc reads from a 0600 file and then deletes (`rm:`).
+/// One viewer at a time; a second one is refused rather than sharing.
+pub fn listener_args(
+    display: &str,
+    desktop: &str,
+    auth: Option<&str>,
     port: u16,
-    mode: StartMode,
-    log_path: &Path,
-) -> Result<Started, String> {
-    let display = session
-        .display
-        .as_deref()
-        .ok_or_else(|| "no X11 display to attach to".to_string())?;
-    let binary = binary()?;
+    password_file: &Path,
+) -> Vec<String> {
+    let mut args = base_args(display, desktop, auth);
+    args.extend([
+        "-localhost".to_string(),
+        "-rfbport".to_string(),
+        port.to_string(),
+        // libvncserver otherwise adds [::1]:5900 even with -noipv6.
+        "-rfbportv6".to_string(),
+        "-1".to_string(),
+        "-passwdfile".to_string(),
+        format!("rm:{}", password_file.display()),
+        "-forever".to_string(),
+        "-nevershared".to_string(),
+        "-dontdisconnect".to_string(),
+    ]);
+    args
+}
+
+pub fn desktop_name() -> String {
+    // ASCII only: the RFB desktop name has no defined encoding.
+    let host: String = crate::util::hostname()
+        .chars()
+        .filter(|character| character.is_ascii_graphic())
+        .take(48)
+        .collect();
+    format!("NIRUREMOTE - {host}")
+}
+
+fn open_log(log_path: &Path) -> Result<(fs::File, fs::File), String> {
     prepare_log(log_path)?;
     let log = fs::OpenOptions::new()
         .create(true)
@@ -101,46 +160,75 @@ pub fn start(
     let log_err = log
         .try_clone()
         .map_err(|error| format!("x11vnc log: {error}"))?;
+    Ok((log, log_err))
+}
 
-    let mut args = vec![
-        "-norc".to_string(),
-        "-display".to_string(),
-        display.to_string(),
-        "-localhost".to_string(),
-        "-rfbport".to_string(),
-        port.to_string(),
-        "-nopw".to_string(),
-        "-forever".to_string(),
-        "-shared".to_string(),
-        "-noxdamage".to_string(),
-        "-repeat".to_string(),
-        "-quiet".to_string(),
-        "-desktop".to_string(),
-        "NIRUREMOTE".to_string(),
-    ];
-    if let Some(auth) = &session.auth_file {
-        args.push("-auth".to_string());
-        args.push(auth.clone());
-    }
-
+/// Start x11vnc speaking RFB on `stream`. It dies with the agent
+/// (`PR_SET_PDEATHSIG`) and when the stream reaches end-of-file.
+pub fn spawn_stream(
+    session: &SessionInfo,
+    stream: std::os::unix::net::UnixStream,
+    log_path: &Path,
+) -> Result<Child, String> {
+    let display = session
+        .display
+        .as_deref()
+        .ok_or_else(|| "no X11 display to attach to".to_string())?;
+    let binary = binary()?;
+    let (_log, log_err) = open_log(log_path)?;
+    let output = stream
+        .try_clone()
+        .map_err(|error| format!("x11vnc stream: {error}"))?;
     let mut command = Command::new(&binary);
     command
-        .args(&args)
+        .args(stream_args(
+            display,
+            &desktop_name(),
+            session.auth_file.as_deref(),
+        ))
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(stream)))
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(output)))
+        .stderr(Stdio::from(log_err));
+    configure_child(&mut command, false, true);
+    command
+        .spawn()
+        .map_err(|error| format!("could not start x11vnc: {error}"))
+}
+
+pub fn start_listener(
+    session: &SessionInfo,
+    port: u16,
+    password_file: &Path,
+    log_path: &Path,
+) -> Result<u32, String> {
+    let display = session
+        .display
+        .as_deref()
+        .ok_or_else(|| "no X11 display to attach to".to_string())?;
+    let binary = binary()?;
+    let (log, log_err) = open_log(log_path)?;
+    let mut command = Command::new(&binary);
+    command
+        .args(listener_args(
+            display,
+            &desktop_name(),
+            session.auth_file.as_deref(),
+            port,
+            password_file,
+        ))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
-    configure_child(
-        &mut command,
-        mode == StartMode::Detached,
-        mode == StartMode::Held,
-    );
+    configure_child(&mut command, true, false);
 
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start x11vnc: {error}"))?;
     let pid = child.id();
 
-    let deadline = Instant::now() + Duration::from_secs(4);
+    // Bounded start-up wait. Readiness is read from /proc/net/tcp, so it
+    // never opens a VNC connection.
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             let tail = read_tail(log_path, 4096).unwrap_or_default();
@@ -148,17 +236,17 @@ pub fn start(
                 "x11vnc exited with {status} while starting: {tail}"
             ));
         }
-        if port_open_local(port, Duration::from_millis(200)) {
-            return Ok(Started {
-                pid,
-                child: (mode == StartMode::Held).then_some(child),
-            });
+        if tcp_listening_local(port) {
+            // Detached on purpose: it outlives this command until `disable`.
+            drop(child);
+            return Ok(pid);
         }
         if Instant::now() >= deadline {
             terminate_pid(pid, Duration::from_secs(1));
+            let _ = child.wait();
             let tail = read_tail(log_path, 4096).unwrap_or_default();
             return Err(format!(
-                "x11vnc did not open 127.0.0.1:{port} within 4s: {tail}"
+                "x11vnc did not open 127.0.0.1:{port} within 5s: {tail}"
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -195,5 +283,41 @@ mod tests {
         assert!(hint_for("void", "").contains("xbps-install"));
         assert!(hint_for("fedora", "").contains("dnf"));
         assert!(hint_for("debian", "ubuntu debian").contains("tigervnc-viewer"));
+    }
+
+    fn has(args: &[String], flag: &str) -> bool {
+        args.iter().any(|argument| argument == flag)
+    }
+
+    #[test]
+    fn stream_mode_has_no_listener_and_no_leftover_flags() {
+        let args = stream_args(":0", "NIRUREMOTE", Some("/run/user/1000/xauth"));
+        assert!(has(&args, "-inetd"));
+        assert_eq!(
+            args.windows(2)
+                .find(|pair| pair[0] == "-rfbport")
+                .map(|pair| pair[1].as_str()),
+            Some("0")
+        );
+        for flag in ["-forever", "-shared", "-many", "-listen", "-http", "-6"] {
+            assert!(!has(&args, flag), "{flag} must not be used");
+        }
+        for flag in ["-norc", "-nocmds", "-noremote", "-noipv6", "-ping"] {
+            assert!(has(&args, flag), "{flag} is required");
+        }
+    }
+
+    #[test]
+    fn listener_mode_is_loopback_and_password_protected() {
+        let args = listener_args(":0", "NIRUREMOTE", None, 43123, Path::new("/x/pw"));
+        assert!(has(&args, "-localhost"));
+        assert!(has(&args, "-nevershared"));
+        assert!(has(&args, "-dontdisconnect"));
+        assert!(has(&args, "rm:/x/pw"));
+        for flag in ["-nopw", "-shared", "-passwd", "-rfbauth", "-6", "-listen"] {
+            assert!(!has(&args, flag), "{flag} must not be used");
+        }
+        // The password itself is never an argument.
+        assert!(!args.iter().any(|argument| argument.contains("passwd ")));
     }
 }

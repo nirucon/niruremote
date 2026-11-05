@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.0 — 2026-11-05
+
+Security and reliability release after the [0.2 review](docs/REVIEW-0.2.md).
+Both ends must run 0.2.0: a 0.1.x host shows `update-needed`, and a 0.1.x
+client is told to update.
+
+- **No listening port for `connect` (S1, S2).** 0.1.x ran
+  `x11vnc -nopw -forever -shared` on a loopback port (plus an unadvertised
+  `[::1]:5900`) and forwarded it with `ssh -L`; any local user on the host or
+  the client could take full control of the desktop without a password. Now
+  the client runs `ssh HOST niruremote stream`, the agent starts
+  `x11vnc -inetd` on a socketpair and relays it over the SSH channel, and the
+  viewer connects through a one-shot, same-uid Unix socket. Nothing listens.
+- **Dropped networks end the session (C1).** The agent stops x11vnc 30 s after
+  the viewer goes silent (x11vnc pings every 5 s). 0.1.x kept x11vnc running as
+  long as sshd kept the dead connection (hours).
+- **`enable` needs a password (S3).** Random 8-character VNC password per
+  `enable`, passed through a 0600 `rm:` file, printed once; loopback only,
+  one viewer at a time, no IPv6 listener.
+- **Hardened SSH (S4).** `ClearAllForwardings`, `ForwardAgent=no`,
+  `ForwardX11=no`, `ControlMaster=no`/`ControlPath=none`, `RemoteCommand=none`,
+  `EscapeChar=none`; host after `--`. Host-key checking stays strict.
+- **x11vnc hardening (S5).** `-nocmds -noremote -norc -noipv6`.
+- **Terminal-escape sanitising (S6)** of tailnet names and remote-agent text.
+- **Locked screens (L1).** `probe` reports the locker; `connect` says the screen
+  is locked. Verified natively that NIRULOCK stays locked.
+- **Session visibility (U2).** Desktop notification on start/end, live session
+  count in `probe`, `disable` ends live sessions.
+- **States (U1).** A host is `ready` whenever a connection is possible (no
+  `enable` needed); new `update-needed`; clearer connect progress messages.
+- **Energy (E1).** No polling while a session runs: the client went from 5 to 0
+  wakeups/s and the host agent from 10 to 0.6 wakeups/s (blocking events, one
+  watchdog deadline). Probes no longer open VNC connections to check a port.
+- **Builds on rustc 1.85 (B1).** Let-chains removed; `rust-version = "1.85"`;
+  CI builds and tests on 1.85 and runs the smoke test.
+- Stale runtime files of a killed client are removed on the next `connect`.
+- `ensure` remains only to answer 0.1.x clients with `upgrade-required`.
+
 ## 0.1.6 — 2026-11-03
 
 - Removed personal host names, Tailscale names, IPs and user identifiers from

@@ -1,8 +1,20 @@
 # NIRUREMOTE roadmap
 
-Status after **0.1.6** (2026-11-02). This is a working list, not a promise that
+Status after **0.2.0** (2026-11-05). This is a working list, not a promise that
 every item belongs in the next release. Security and access-affecting work comes
 before cosmetics.
+
+## Done in 0.2.0
+
+- [x] Bare-metal acceptance between Debian 13, Arch and Void (see
+  [docs/REVIEW-0.2.md](docs/REVIEW-0.2.md)).
+- [x] Session discovery verified on the real NIRUX session (`/proc` path,
+  startx `serverauth` Xauthority).
+- [x] No listening port for `connect` (x11vnc `-inetd` over SSH).
+- [x] Per-enable VNC password for the manual-tunnel listener, never in argv.
+- [x] Dead-path watchdog; `disable` ends live sessions.
+- [x] Desktop notification on session start/end (NIRUNOTIFY via notify-send).
+- [x] Builds and tests on rustc 1.85 in CI.
 
 ## Done in 0.1.6
 
@@ -26,10 +38,6 @@ before cosmetics.
 
 ## P0 — before calling this a NIRUX extra
 
-- [ ] Run the bare-metal acceptance matrix in [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)
-      on two real NIRUX/X11 machines. Record the result.
-- [ ] Verify session discovery on the real NIRUX session manager (logind,
-      startx and `who` fallbacks) and record which path was used.
 - [ ] Add a NIRUX launcher view (`nirulauncher --remote` or the Tailscale view)
       using `niruremote peers --json` and `niruremote connect`.
 - [ ] Add NIRUBAR: a small screen indicator while a local remote session is
@@ -39,12 +47,13 @@ before cosmetics.
 
 ## P1 — security and lifecycle
 
-- [ ] Per-session VNC password in a 0600 file, passed to x11vnc without argv,
-      and to the viewer without shell interpolation. Keep `-localhost`.
 - [ ] A user service (`systemd --user` and runit) so `enable` survives
       logout/reboot when explicitly requested. Default remains off.
-- [ ] A visible local indicator and NIRUNOTIFY on connection/disconnection,
-      with a Disconnect action.
+- [ ] A NIRUBAR indicator while a session is active, and a Disconnect action
+      on the notification.
+- [ ] Reduce x11vnc's per-session polling cost (~600 wakeups/s, 1.5 % CPU on
+      a laptop; `-xdamage`/cursor options made no difference).
+- [ ] Windows/macOS real-target tests (no such machine online in 0.2.0).
 - [ ] Bounded audit history: source Tailscale/SSH address, start/stop, errors.
       No screen content, keystrokes or secrets.
 - [ ] Refuse to attach when the X server belongs to another user; test the

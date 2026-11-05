@@ -18,6 +18,15 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release --locked
+      - run: ./tests/smoke-local.sh
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: cargo build --locked
+      - run: cargo test --locked
 
   shell:
     runs-on: ubuntu-latest

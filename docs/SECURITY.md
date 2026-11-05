@@ -12,20 +12,26 @@ feature. The default design keeps the network surface as small as possible.
 4. **The viewer** is the only process that receives screen content and sends
    input.
 
-x11vnc is not exposed to Tailscale by default. It binds `127.0.0.1`; the viewer
-reaches it through an SSH local forward. `-nopw` is used because the tunnel is
-the authentication boundary. This is safe only while all of these remain true:
+Since 0.2.0, `connect` gives x11vnc **no listening socket at all**. The
+client runs the fixed command `ssh HOST niruremote stream`; the agent starts
+`x11vnc -inetd` on a socketpair and relays it over that SSH channel. Nothing is
+reachable from the LAN, the tailnet, or another local user on either machine.
+On the client, the viewer connects through a Unix socket in a 0700 directory
+that accepts exactly one connection from the same uid and is unlinked before
+any desktop data flows.
 
-- the listener is loopback-only;
-- SSH host keys are verified;
-- the host is not shared with untrusted local users;
-- no firewall or proxy forwards the loopback port.
-
-If you change any of those, add a real per-session VNC credential first.
+`enable` (for manual Windows/macOS tunnels) is the only listener. It binds
+`127.0.0.1` only (no IPv6, no `[::1]:5900`) and requires a random 8-character
+VNC password generated per `enable`, handed to x11vnc in a 0600 `rm:` file and
+shown once in the terminal. VNC authentication is weak (DES, 8 characters), so
+`enable` is opt-in and documented as the weaker mode.
 
 ## Host keys
 
-`ssh` runs with `StrictHostKeyChecking=yes` and `BatchMode=yes`. A new or changed
+`ssh` runs with `StrictHostKeyChecking=yes` and `BatchMode=yes`, plus
+`ClearAllForwardings=yes`, `ForwardAgent=no`, `ForwardX11=no`,
+`ControlMaster=no`/`ControlPath=none` and `RemoteCommand=none`, so a user
+`~/.ssh/config` cannot add listeners or keep a session alive after disconnect. A new or changed
 host key fails closed. The UI must show `host-key-untrusted`; it must not offer a
 one-click "accept anyway". The user verifies the fingerprint in a terminal.
 
@@ -49,15 +55,21 @@ current user.
 - The agent never unlocks the session, reads the clipboard, logs keystrokes or
   stores screen content.
 - x11vnc logs contain connection metadata and errors, not screen pixels.
-- NIRUNOTIFY/NIRUBAR connection indicators are planned so the local user can
-  see that a remote session exists.
+- A desktop notification (notify-send/NIRUNOTIFY) announces session start and
+  end; a NIRUBAR indicator is still planned.
+- Verified natively on 0.2.0: connecting to a session locked by NIRULOCK shows
+  the lock screen, pointer/key input reaches NIRULOCK, and the lock stays
+  (same NIRULOCK process before and after).
 
 ## Enablement
 
-- `connect` is temporary: x11vnc is held by the SSH channel and dies when the
-  channel closes.
-- `enable` is the explicit opt-in that leaves a loopback listener running.
-- `disable` stops it. Logout/reboot also stops the 0.1.x service.
+- `connect` is temporary: x11vnc lives inside the SSH channel and stops when
+  the channel closes, the client is killed, or the path goes quiet for 30 s.
+- `enable` is the explicit opt-in that leaves a password-protected loopback
+  listener running.
+- `disable` stops it and ends live sessions. Logout/reboot also stops it.
+- The person at the machine gets a desktop notification when a session starts
+  and ends, and `niruremote probe` shows live sessions.
 - There is no default-on listener after installation.
 
 ## What is not exposed
@@ -85,11 +97,14 @@ NIRUREMOTE does not enable, configure or weaken either service remotely.
 - **Stolen SSH key:** the attacker can start a session if the user is logged in
   to X11. This is the same blast radius as SSH access plus `DISPLAY`/Xauthority
   access. Use SSH key passphrases, an agent, and Tailscale ACLs.
-- **Malicious tailnet member:** cannot reach the VNC port because it is loopback
-  only. They would need SSH access and a trusted host key.
-- **Local multi-user host:** another local user could connect to a loopback
-  `-nopw` VNC port. Do not use the current credential model on a shared
-  workstation. The per-session password item in the roadmap addresses this.
+- **Malicious tailnet member:** there is no VNC port to reach. They would need
+  SSH access and a trusted host key.
+- **Local multi-user host:** `connect` opens no port; another local user has
+  nothing to connect to. The `enable` listener needs its password. (0.1.x used
+  an unauthenticated `-nopw` loopback port that any local uid could use; see
+  REVIEW-0.2 S1.)
+- **Dropped network:** the agent ends a session 30 s after the viewer stops
+  sending; x11vnc never outlives a dead path for long.
 - **Compromised remote agent:** it can return false JSON, but it already runs
   as the user with access to the display. Do not execute probe output as
   commands.

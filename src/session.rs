@@ -37,8 +37,9 @@ pub fn discover() -> SessionInfo {
 }
 
 fn environment_display() -> Option<String> {
-    if let Ok(display) = std::env::var("NIRUREMOTE_DISPLAY")
-        && display.starts_with(':')
+    if let Some(display) = std::env::var("NIRUREMOTE_DISPLAY")
+        .ok()
+        .filter(|display| display.starts_with(':'))
     {
         return Some(display);
     }
@@ -276,16 +277,53 @@ fn x_display_from_args(args: &[String]) -> Option<(String, Option<String>)> {
     Some((display, auth_file))
 }
 
-pub fn find_auth() -> Option<String> {
-    if let Ok(path) = std::env::var("NIRUREMOTE_XAUTHORITY")
-        && PathBuf::from(&path).exists()
-    {
-        return Some(path);
+/// Screen lockers that grab the X display while the session is locked.
+const LOCKERS: &[&str] = &[
+    "nirulock",
+    "slock",
+    "i3lock",
+    "xsecurelock",
+    "xlock",
+    "physlock",
+    "light-locker",
+];
+
+/// The running screen locker owned by the current user, if any.
+///
+/// NIRUREMOTE never interacts with it. It is reported so the client can say
+/// "the screen is locked" instead of showing a surprise lock screen. Input
+/// from the viewer reaches the locker like local input; only the account
+/// password (PAM) unlocks it.
+pub fn screen_locker() -> Option<String> {
+    let our_uid = uid();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = entry.file_name();
+        if name.to_str().is_none_or(|pid| pid.parse::<u32>().is_err()) {
+            continue;
+        }
+        let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
+            continue;
+        };
+        let comm = comm.trim();
+        if !LOCKERS.contains(&comm) {
+            continue;
+        }
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(entry.path()).is_ok_and(|metadata| metadata.uid() == our_uid) {
+            return Some(comm.to_string());
+        }
     }
-    if let Ok(path) = std::env::var("XAUTHORITY")
-        && PathBuf::from(&path).exists()
-    {
-        return Some(path);
+    None
+}
+
+pub fn find_auth() -> Option<String> {
+    for variable in ["NIRUREMOTE_XAUTHORITY", "XAUTHORITY"] {
+        if let Some(path) = std::env::var(variable)
+            .ok()
+            .filter(|path| PathBuf::from(path).exists())
+        {
+            return Some(path);
+        }
     }
 
     let mut candidates = vec![home_dir().join(".Xauthority")];

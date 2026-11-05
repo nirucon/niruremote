@@ -170,8 +170,8 @@ pub fn parse(bytes: &[u8]) -> Result<Snapshot, String> {
 
 pub fn all_peers(snapshot: &Snapshot, include_self: bool) -> Vec<Peer> {
     let mut peers = snapshot.peers.clone();
-    if include_self && let Some(self_peer) = snapshot.self_peer.clone() {
-        peers.push(self_peer);
+    if include_self {
+        peers.extend(snapshot.self_peer.clone());
     }
     peers.sort_by(|left, right| {
         right

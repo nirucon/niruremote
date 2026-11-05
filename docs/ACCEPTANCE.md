@@ -4,10 +4,8 @@ Use two Linux/NIRUX machines with X11. Call them **host** (the desktop to reach)
 and **client** (the machine you sit at). Do not use a headless server as the
 host for the first pass.
 
-Before bare metal, 0.1.6 was exercised in disposable Debian 12 and Arch Linux
-containers with a real Xvfb server, real x11vnc and the real TigerVNC viewer.
-Void package names were verified against void-packages, but the full Void
-runtime test is still required below.
+0.2.0 was run natively between Debian 13, Arch and Void hosts; the record is in
+[REVIEW-0.2.md](REVIEW-0.2.md). Both ends must run 0.2.0 or newer.
 
 ## Platform matrix
 
@@ -28,7 +26,7 @@ On both machines:
 ```sh
 cd /path/to/niruremote
 ./install.sh
-niruremote version          # must print: niruremote 0.1.6
+niruremote version          # must print: niruremote 0.2.0
 niruremote setup --run      # Debian: x11vnc + tigervnc-viewer
                             # Arch:  x11vnc + tigervnc
                             # Void:  x11vnc + tigervnc
@@ -43,7 +41,9 @@ niruremote probe
 Expected: `session: x11 :0`, `x11vnc: installed`, `state: inactive`.
 
 - [ ] `probe` finds `:0` and an Xauthority file.
-- [ ] `probe --json` includes `"schema": 1` and `"state": "inactive"`.
+- [ ] `probe --json` includes `"schema": 1`, `"state": "inactive"` and
+      `"ssh-stdio"` in `supported_modes`.
+- [ ] With the screen locked, `probe` shows `screen: locked (nirulock)`.
 
 ## 1. Client discovery
 
@@ -53,7 +53,8 @@ On the client:
 niruremote peers --refresh --timeout 5
 ```
 
-- [ ] The host appears as `inactive` (not `not-installed`).
+- [ ] The host appears as `ready` (not `not-installed`); a 0.1.x host shows
+      `update-needed`.
 - [ ] Offline peers still appear with `offline` and last-seen age.
 - [ ] Android/iOS peers show `unsupported`.
 - [ ] A Windows peer with RDP enabled shows `client-ready` (if FreeRDP is
@@ -66,22 +67,14 @@ niruremote peers --refresh --timeout 5
 If the host shows `host-key-untrusted`, run `ssh HOST` once in a terminal and
 verify the fingerprint. Do not disable host-key checking.
 
-## 2. Enable and disable on the host
+## 2. Graphical connection
 
-On the host:
+On the host, before and during the session:
 
 ```sh
-niruremote enable
-ss -ltnp | grep 127.0.0.1
+ss -ltnp | grep -v -e '127.0.0.' -e '\[::1\]'   # non-loopback listeners
+ss -ltnpx | grep x11vnc                          # must stay empty
 ```
-
-- [ ] The listener is on `127.0.0.1:<port>`, never `0.0.0.0` or a Tailscale IP.
-- [ ] `niruremote probe` reports `state: ready`, `owner: enable`.
-- [ ] From the client, `niruremote peers --refresh` reports `ready`.
-- [ ] `niruremote disable` stops it and the port disappears.
-- [ ] `niruremote disable` again is harmless.
-
-## 3. Graphical connection
 
 On the client:
 
@@ -91,24 +84,35 @@ niruremote connect HOST
 
 - [ ] A real TigerVNC window opens and shows the host desktop.
 - [ ] Mouse and keyboard work; Super/keyboard grabs behave as expected.
-- [ ] Closing the viewer prints `disconnected`.
-- [ ] Ctrl+C in the terminal prints `interrupted` and closes the viewer.
-- [ ] After exit, the client has no leftover `ssh -L` process:
+- [ ] The host shows a "Remote desktop — session started" notification.
+- [ ] During the session x11vnc has **no** TCP or Unix listener on the host,
+      and the client has none either (`ss -ltnpx`).
+- [ ] Closing the viewer prints `disconnected`; Ctrl+C prints `interrupted`.
+- [ ] After exit: no `x11vnc` on the host, no `ssh … niruremote stream` on the
+      client, `niruremote probe` shows `sessions: 0`.
+- [ ] `kill -9` of the client process: x11vnc on the host is gone within
+      seconds.
+- [ ] Dropped path (suspend the client or `kill -STOP` its ssh child): x11vnc
+      on the host is gone within ~30 s.
+- [ ] `niruremote disable` on the host ends a running session.
 
-```sh
-pgrep -af 'ssh -N -L'
-```
+## 3. Locked screen
 
-- [ ] After the host session was temporary (`connect` without `enable`), the
-      host has no leftover x11vnc:
+Lock the host (NIRULOCK), then connect.
 
-```sh
-pgrep -af x11vnc
-niruremote probe       # state: inactive
-```
+- [ ] `connect` says the screen is locked.
+- [ ] The viewer shows the lock screen, not the desktop.
+- [ ] Mouse/key input does not unlock it; the same NIRULOCK process is still
+      running afterwards. Only the account password typed into NIRULOCK
+      unlocks (PAM), exactly as at the machine.
 
-- [ ] With `enable` already active, `connect` reuses the listener and does not
-      start a second x11vnc.
+## 3b. Manual-tunnel listener (`enable`)
+
+- [ ] `niruremote enable` prints a port and a password.
+- [ ] `ss -ltnp` shows x11vnc only on `127.0.0.1:<port>` (no `[::1]:5900`).
+- [ ] A viewer without the password is refused; the password is not in
+      `ps`, the log or `probe --json`.
+- [ ] `niruremote disable` stops it; running it again is harmless.
 
 ## 4. Platform-specific checks
 
@@ -128,7 +132,7 @@ niruremote probe       # state: inactive
 
 - [ ] `x11vnc`, `tigervnc` and `openssh` are installed with `xbps-install`.
 - [ ] `sshd` is enabled under runit.
-- [ ] `enable` starts x11vnc without a systemd service.
+- [ ] `connect` works without any service (runit + elogind).
 - [ ] Optional: `freerdp` provides the RDP client.
 
 ### Windows target
@@ -148,9 +152,10 @@ niruremote probe       # state: inactive
 
 ### Windows/macOS client to a NIRUX host
 
-- [ ] On the host, `niruremote enable` prints a loopback port.
+- [ ] On the host, `niruremote enable` prints a loopback port and password.
 - [ ] The manual `ssh -N -L 5900:127.0.0.1:<PORT> user@HOST` tunnel works.
-- [ ] A VNC viewer connects to `127.0.0.1:5900` and shows the host desktop.
+- [ ] A VNC viewer connects to `127.0.0.1:5900`, asks for the password and
+      shows the host desktop.
 - [ ] Closing the viewer and the SSH tunnel leaves no x11vnc on the host when
       the session was temporary (`connect` or `disable`).
 
@@ -167,13 +172,11 @@ niruremote probe       # state: inactive
 
 ## 6. Security checks
 
-- [ ] `ss -ltnp` on the host shows x11vnc only on `127.0.0.1`.
-- [ ] `tailscale status` / another tailnet machine cannot reach the VNC port
-      directly; only the SSH tunnel works.
+- [ ] `connect` creates no listener on either machine; `enable` only on
+      `127.0.0.1`.
 - [ ] No Tailscale Funnel/Serve configuration was created.
 - [ ] `niruremote doctor` does not print secrets or the Xauthority contents.
 - [ ] `~/.local/state/niruremote` is `0700` and its files are `0600`.
-- [ ] The host lock screen is visible through VNC and is not bypassed.
 - [ ] Logging out on the host stops the session.
 
 ## 7. Record

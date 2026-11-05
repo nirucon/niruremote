@@ -4,17 +4,16 @@
 
 NIRUREMOTE lets you list every machine in your Tailscale tailnet, see whether
 remote desktop is actually installed and ready on it, and open a real graphical
-session without exposing a new public port. Linux/X11 hosts use **x11vnc**
-attached to the existing session, reached through an authenticated **SSH
-tunnel** on loopback. Windows hosts can be opened with RDP and macOS hosts with
+session without opening any port. Linux/X11 hosts use **x11vnc** attached to
+the existing session, carried **inside the SSH connection itself**: no VNC
+port exists on the host, the client, the LAN or the tailnet. Windows hosts can be opened with RDP and macOS hosts with
 VNC when those services are enabled on the target.
 
-**Current release: 0.1.6.** This is a working core, not a finished desktop
-product. The agent, client, Tailscale discovery, capability cache, SSH tunnel,
-Linux/X11 connection, Windows/macOS client paths, installers and diagnostics
-are implemented. The NIRUX extras row is on `nirux` main and will appear in
-the next NIRUX release. The NIRULAUNCHER view is the next integration step; the
-0.1.6 CLI is usable on its own.
+**Current release: 0.2.0** — a security and reliability release after the
+[0.2 review](docs/REVIEW-0.2.md). The command-line client and agent are
+complete; the NIRULAUNCHER view is the next integration step. Both ends must
+run 0.2.0 or newer: a 0.1.x agent is shown as `update-needed`, and a 0.1.x
+client is told to update.
 
 ## Testing status
 
@@ -29,7 +28,11 @@ the next NIRUX release. The NIRULAUNCHER view is the next integration step; the
   documented; a real Windows target test is pending.
 - **macOS**: Screen Sharing/VNC client path and instructions are documented; a
   real macOS target test is pending.
-- **Debian 13 host:** verified live with a real X11 session and x11vnc.
+- **Bare metal, 0.2.0 (2026-11-05):** real TigerVNC connections over Tailscale
+  between Debian 13 (othala), Arch (algiz) and Void (void) in both directions
+  that apply (othala→void, void→othala, othala→algiz, void→algiz), with
+  `ss` showing no new listener, x11vnc gone after disconnect, `kill -9` of the
+  client and a stalled network path, and NIRULOCK staying locked.
 - **Bare metal is still required.** Run [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)
   before relying on it for daily access.
 
@@ -38,18 +41,19 @@ the next NIRUX release. The NIRULAUNCHER view is the next integration step; the
 - **Tailscale is the network.** No relay, account, cloud inbox or public port.
 - **SSH is the control plane.** Remote capability checks use a fixed command
   (`niruremote probe --json`), never a shell string.
-- **Loopback is the default.** x11vnc listens on `127.0.0.1` only. The viewer
-  reaches it through `ssh -L`; no VNC port is opened on the tailnet.
+- **No port at all.** `connect` runs `x11vnc -inetd` on the SSH channel. On the
+  client the viewer uses a private one-shot Unix socket. Nothing listens.
 - **Truthful states.** "Online" is not "ready". NIRUREMOTE distinguishes
-  `not installed`, `installed but inactive`, `no X11 session`, `x11vnc
-  missing`, `host key untrusted`, `SSH denied`, `offline` and `unsupported`.
-- **Explicit enablement.** `connect` starts a temporary session. `enable`
-  allows connections until `disable`, logout or reboot. Nothing listens before
-  you ask for it.
+  `ready`, `not-installed`, `update-needed`, `no-session`, `backend-missing`,
+  `host-key-untrusted`, `ssh-denied`, `offline` and `unsupported`, and says
+  when the remote screen is locked.
+- **Temporary by default.** A session lives exactly as long as the SSH
+  channel: closing the viewer, Ctrl+C, killing the client or losing the
+  network ends it. `enable` is only for manual Windows/macOS tunnels.
 
 ## Platform support
 
-| Role | Platform | Status in 0.1.6 |
+| Role | Platform | Status in 0.2.0 |
 |---|---|---|
 | Host (share a desktop) | Debian / Ubuntu, Arch, Void (X11) | **supported** |
 | Client (open a session) | Debian / Ubuntu, Arch, Void | **supported** |
@@ -83,13 +87,13 @@ all use the same binary; no Rust installation is required on the target.
   show `ssh-denied`, not a hanging prompt.
 - **A VNC viewer on the client** (TigerVNC). For Windows targets, **FreeRDP**.
 - **A real X11 session on the host.** A headless server shows `no-session`;
-  NIRUREMOTE does not create a virtual desktop in 0.1.6.
+  NIRUREMOTE does not create a virtual desktop.
 
 ## Requirements
 
 On a Linux machine that will be shared (the host):
 
-- X11 desktop session (NIRUX is X11; Wayland is not supported in 0.1.6)
+- X11 desktop session (NIRUX is X11; Wayland is not supported)
 - `x11vnc`
 - `sshd`, reachable over Tailscale
 - NIRUREMOTE installed in a non-interactive SSH `PATH` (the default
@@ -260,7 +264,7 @@ ssh HOST niruremote probe --json
 In a NIRUX graphical session, start the agent from the session (or use your
 keyring) so the launcher and terminal inherit `SSH_AUTH_SOCK`.
 
-NIRUREMOTE 0.1.6 also looks for a working agent itself: it checks the current
+NIRUREMOTE also looks for a working agent itself: it checks the current
 `SSH_AUTH_SOCK`, then `gcr/ssh`, `openssh_agent`, `keyring/ssh` and `ssh-agent`,
 and uses the first socket that actually has identities. This handles the common
 NIRUX/GNOME Keyring case where the session points at an empty
@@ -343,9 +347,9 @@ NIRUREMOTE connects **to** macOS; it does not enable or configure macOS.
 
 ## Connecting from Windows or macOS to a NIRUX host
 
-NIRUREMOTE 0.1.6 is a Linux client. To reach a NIRUX/Linux host from a Windows
-or macOS machine, use the standard SSH client plus a VNC viewer. The host's
-x11vnc listener is loopback-only by design.
+NIRUREMOTE is a Linux client. To reach a NIRUX/Linux host from a Windows or
+macOS machine, use the standard SSH client plus a VNC viewer against the
+`enable` listener, which is loopback-only and password-protected.
 
 On the NIRUX host:
 
@@ -354,8 +358,9 @@ niruremote enable
 niruremote probe --json
 ```
 
-Read the `port` value from the probe JSON (for example `43123`). The listener is
-still `127.0.0.1` on the host; the SSH tunnel is the only ingress.
+`enable` prints the port (for example `43123`) and a one-time VNC password.
+The listener is `127.0.0.1` only; the SSH tunnel is the only ingress, and the
+viewer must also give the password. Run `niruremote disable` when done.
 
 On Windows (PowerShell with OpenSSH) or macOS (Terminal), create a local tunnel
 and keep it open:
@@ -376,10 +381,10 @@ Then connect a VNC viewer to `127.0.0.1:5900`:
 - macOS: TigerVNC Viewer, or the built-in Screen Sharing client with
   `vnc://127.0.0.1:5900`.
 
-Use the actual port from `niruremote probe`, not a hardcoded remote port. The
-local `5900` only needs to be free on the Windows/macOS client. Verify the SSH
-host key fingerprint before accepting it. The Linux `niruremote connect`
-command performs this tunnel automatically.
+Use the actual port that `enable` printed, not a hardcoded remote port. The
+viewer asks for the VNC password. The local `5900` only needs to be free on the
+Windows/macOS client. Verify the SSH host key fingerprint before accepting it.
+Linux clients do not need any of this: `niruremote connect` opens no port.
 
 ## Quick start
 
@@ -387,8 +392,9 @@ On the host (the machine you want to reach):
 
 ```sh
 niruremote probe            # is there an X11 session? is x11vnc installed?
-niruremote enable           # allow connections until disable/logout/reboot
 ```
+
+Nothing else is needed on the host: no service, no open port.
 
 On the client (the machine you sit at):
 
@@ -399,24 +405,28 @@ niruremote connect desktop
 
 `connect` will:
 
-1. verify the remote agent and X11 session over SSH;
-2. start a temporary x11vnc on the remote loopback interface;
-3. open an SSH local forward;
-4. start the local VNC viewer against `127.0.0.1`;
-5. tear everything down when the viewer exits or you press Ctrl+C.
+1. check the remote agent and X11 session over SSH (and tell you if the
+   screen is locked);
+2. open the VNC viewer on a private one-shot Unix socket;
+3. run `ssh HOST niruremote stream`, which starts `x11vnc -inetd` on the SSH
+   channel — the viewer's connection *is* the SSH channel's stdin/stdout;
+4. end everything when the viewer closes, you press Ctrl+C, the client is
+   killed, or the network path dies (within 30 s on the host, ~15 s on the
+   client).
 
-You do **not** need to run `enable` before `connect`. `enable` is the
-convenience path that keeps a loopback listener available for more than one
-connection.
+You do **not** need `enable` for `connect`. The host shows a desktop
+notification when a session starts and ends.
 
 ## Commands
 
 ```text
 niruremote probe [--json]              inspect the local agent
 niruremote status [--json]             alias for probe
-niruremote enable                      allow connections until disable/logout/reboot
-niruremote disable                     stop x11vnc and remove runtime state
-niruremote ensure [--json] [--hold]    start/reuse the backend (used by connect)
+niruremote enable                      password-protected loopback listener for
+                                       manual Windows/macOS tunnels
+niruremote disable                     stop the listener and end live sessions
+niruremote stream                      serve one session on stdin/stdout
+                                       (run by connect over SSH)
 niruremote setup [--run]               check/install x11vnc and a VNC viewer
 niruremote peers [--json] [--refresh] [--timeout N]
 niruremote connect MACHINE [--print] [--timeout N]
@@ -431,9 +441,8 @@ planned SSH/VNC/RDP path without starting a session.
 
 | State | Meaning |
 |---|---|
-| `ready` | Verified: agent, X11 session and x11vnc are ready |
-| `starting` | x11vnc is running but its loopback port is not open yet |
-| `inactive` | Agent installed, X11 session found, remote desktop is off |
+| `ready` | Verified: agent 0.2+, X11 session and x11vnc — connect any time |
+| `update-needed` | The machine runs NIRUREMOTE 0.1.x; update it there |
 | `not-installed` | SSH works but `niruremote` was not found remotely |
 | `backend-missing` | Agent installed but `x11vnc` is missing |
 | `no-session` | Agent installed but no active X11 desktop was found |
@@ -446,27 +455,27 @@ planned SSH/VNC/RDP path without starting a session.
 | `no-local-client` | Target is reachable but the local RDP/VNC client is missing |
 | `unsupported` | Mobile/other peer, not a desktop host |
 
-The cache lives in `~/.cache/niruremote/peers.json`. Without `--refresh` the
+The detail column adds `screen locked (nirulock)`, active sessions and an
+enabled manual-tunnel listener when they apply. The cache lives in `~/.cache/niruremote/peers.json`. Without `--refresh` the
 client reads the cache; with `--refresh` it probes online peers in parallel and
 updates the cache. Offline peers are never probed.
 
 ## Linux/X11 connection
 
 ```text
-client                                    host
-  |  ssh host niruremote ensure --json --hold
-  |---------------------------------------->|
-  |          x11vnc -localhost -nopw ...   |
-  |<--- {"state":"ready","port":43123} -----|
-  |  ssh -N -L 127.0.0.1:42729:127.0.0.1:43123 host
-  |---------------------------------------->|
-  |  vncviewer 127.0.0.1::42729             |
+client                                       host
+  ssh host niruremote probe --json  ------->  (read-only)
+  vncviewer /run/user/UID/niruremote/view-PID.sock
+     | accepted once (same uid), socket unlinked
+  ssh -T ... -- host niruremote stream ----->  niruremote stream
+     stdin/stdout = viewer connection            socketpair <-> x11vnc -inetd
 ```
 
-The remote `ensure --hold` process keeps x11vnc alive while its stdin is open.
-If the SSH channel closes, stdin reaches EOF and the agent removes state and
-stops x11vnc. The SSH children also have `PR_SET_PDEATHSIG`, so a killed client
-does not leave orphan tunnels behind.
+There is no `ssh -L` and no listening socket. The agent relays the SSH channel
+to x11vnc and ends the session on EOF, on a signal, when x11vnc exits, or after
+30 s without traffic from the viewer (x11vnc pings every 5 s). The client's
+SSH and viewer children have `PR_SET_PDEATHSIG`, so a killed client closes the
+channel and the host stops x11vnc immediately.
 
 ## Windows and macOS: what NIRUREMOTE does
 
@@ -488,17 +497,23 @@ and a local client is installed.
 ## Security model
 
 - x11vnc runs as the logged-in user, never as root.
-- The listener is `127.0.0.1` only. `-nopw` is used because the only ingress is
-  an authenticated SSH tunnel; no VNC port is reachable from the tailnet.
-  Do not change this to `0.0.0.0` without adding real VNC authentication.
-- SSH uses `BatchMode=yes`, `StrictHostKeyChecking=yes` and a short
-  `ConnectTimeout`. Unknown or changed host keys fail closed; verify them in a
-  terminal first.
-- `probe` is read-only. `ensure` starts x11vnc. `enable` is the explicit
-  long-lived opt-in.
-- The agent attaches only to the current user's X11 session. It never attaches
-  to another user or a login greeter.
-- The lock screen is respected. NIRUREMOTE does not bypass or auto-unlock it.
+- `connect` opens no port anywhere. The SSH login (key, verified host key) is
+  the authentication; the viewer endpoint on the client is a one-shot Unix
+  socket checked for the same uid.
+- `enable` is a `127.0.0.1`-only listener with a random per-enable VNC
+  password, given to x11vnc through a 0600 file it deletes, never via argv.
+- SSH uses `BatchMode=yes`, `StrictHostKeyChecking=yes`, a short
+  `ConnectTimeout`, and clears forwardings, agent/X11 forwarding and
+  connection sharing from user config. Unknown or changed host keys fail
+  closed; verify them in a terminal first.
+- The remote commands are fixed (`niruremote probe --json`,
+  `niruremote stream`); host names are validated and passed after `--`.
+- The agent attaches only to the current user's X11 session, never to another
+  user or a login greeter.
+- The lock screen is respected. A remote viewer of a locked session sees
+  NIRULOCK; only the account password unlocks it. NIRUREMOTE never unlocks.
+- The host gets a desktop notification when a session starts and ends;
+  `niruremote disable` ends every session.
 - Tailscale Funnel is never used. No public endpoint is created.
 - State and cache files are private (`0700` directories, `0600` files).
 - `setup --run` shows the package command and inherits the terminal, so sudo
@@ -527,12 +542,16 @@ niruremote peers --refresh --timeout 5
 
 - **`no-session`**: the machine is headless or nobody is logged in to an X11
   desktop. Log in at the machine first; headless servers do not get a virtual
-  desktop in 0.1.6.
+  desktop.
 - **`backend-missing`**: install `x11vnc` on the host.
 - **`host-key-untrusted`**: run `ssh HOST` once in a terminal and verify the
   fingerprint. NIRUREMOTE will not accept a new key automatically.
 - **`ssh-denied`**: unlock the SSH key or add it to the remote
   `authorized_keys`.
+- **`update-needed`**: the host runs NIRUREMOTE 0.1.x. Update it there
+  (`nirux extras update`, or `./install.sh`).
+- **Locked screen**: you see NIRULOCK; type the account password in the viewer
+  to unlock, exactly as at the machine.
 - **`not-installed`**: install NIRUREMOTE in `/usr/local/bin` on the host so a
   non-interactive SSH command can find it.
 - **Viewer missing**: install `tigervnc-viewer` (Debian/Ubuntu) or `tigervnc`
@@ -553,6 +572,9 @@ NIRUREMOTE_X11VNC      force the x11vnc binary (fake backend in tests)
 NIRUREMOTE_SSH         force the ssh binary (fake SSH in tests)
 NIRUREMOTE_VIEWER      force the local VNC viewer
 NIRUREMOTE_TAILSCALE   force the tailscale binary
+NIRUREMOTE_RUNTIME_DIR runtime directory (sockets, session records)
+NIRUREMOTE_IDLE_SECS   dead-path watchdog, 2-600 s (default 30)
+NIRUREMOTE_NOTIFY=off  no desktop notifications from `stream`
 ```
 
 ## Development
@@ -564,24 +586,27 @@ cargo test
 cargo build --release --locked
 ```
 
+`rust-version` is 1.85 (Debian 13's rustc); CI builds and tests on it.
 The local smoke test uses a fake x11vnc, a fake SSH and a fake viewer so the
-full Linux path can be exercised without an X server:
+full Linux path (including the dead-path watchdog and `kill -9`) can be
+exercised without an X server:
 
 ```sh
 ./tests/smoke-local.sh
 ```
 
-## Limits in 0.1.6
+## Limits in 0.2.0
 
 - Linux/X11 only for hosts. Wayland is reported, not supported.
-- `enable` does not survive a reboot or logout. A user service is planned.
+- `enable` does not survive a reboot or logout.
 - No audio, file transfer, printer/USB redirection or multi-monitor picker.
   Use NIRUSHARE for files.
-- One VNC credential model: SSH is the authentication boundary. Per-session
-  VNC passwords and a direct-tailnet opt-in are planned.
+- An active session costs what x11vnc's screen polling costs (about 1.5 % of
+  one core and ~600 wakeups/s measured on a laptop); nothing runs when no
+  session is open.
 - Windows/macOS are targets only when their own remote service is already
   enabled. No remote OS configuration.
-- NIRULAUNCHER/NIRUBAR integration is specified but not shipped in 0.1.6.
+- NIRULAUNCHER/NIRUBAR integration is specified but not shipped.
 
 ## License
 

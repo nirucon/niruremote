@@ -41,7 +41,16 @@ pub struct LocalState {
     pub owner: Option<String>,
     pub last_error: Option<String>,
     pub supported_modes: Vec<String>,
+    /// Screen locker running in the shared session (`nirulock`, ...).
+    #[serde(default)]
+    pub locker: Option<String>,
+    /// Live `connect` sessions served by this agent.
+    #[serde(default)]
+    pub sessions: u32,
 }
+
+/// Remote-desktop mode served over the SSH channel itself (0.2.0+).
+pub const MODE_STREAM: &str = "ssh-stdio";
 
 impl LocalState {
     pub fn new() -> Self {
@@ -62,7 +71,9 @@ impl LocalState {
             mode: "loopback".into(),
             owner: None,
             last_error: None,
-            supported_modes: vec!["ssh-tunnel".into()],
+            supported_modes: Vec::new(),
+            locker: None,
+            sessions: 0,
         }
     }
 }

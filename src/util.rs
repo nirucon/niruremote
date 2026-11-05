@@ -224,9 +224,7 @@ static SSH_AGENT_INIT: std::sync::Once = std::sync::Once::new();
 pub fn ensure_ssh_agent_env() {
     SSH_AGENT_INIT.call_once(|| {
         let current = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
-        if let Some(current) = &current
-            && agent_has_identities(current)
-        {
+        if current.as_deref().is_some_and(agent_has_identities) {
             return;
         }
 
@@ -292,10 +290,9 @@ pub fn find_in_path(name: &str) -> Option<PathBuf> {
     }
     for directory in directories {
         let candidate = directory.join(name);
-        if let Ok(metadata) = fs::metadata(&candidate)
-            && metadata.is_file()
-            && metadata.permissions().mode() & 0o111 != 0
-        {
+        let executable = fs::metadata(&candidate)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+        if executable {
             return Some(candidate);
         }
     }
@@ -316,11 +313,6 @@ pub fn port_open_ip(ip: &str, port: u16, timeout: Duration) -> bool {
         return false;
     };
     let address = SocketAddr::new(ip, port);
-    TcpStream::connect_timeout(&address, timeout).is_ok()
-}
-
-pub fn port_open_local(port: u16, timeout: Duration) -> bool {
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&address, timeout).is_ok()
 }
 
@@ -368,6 +360,26 @@ pub fn terminate_pid(pid: u32, grace: Duration) {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
     }
+}
+
+/// Stop and reap one of our own children: SIGTERM, a bounded grace period,
+/// then SIGKILL. Used only on teardown.
+pub fn stop_child(child: &mut std::process::Child, grace: Duration) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub fn is_valid_host(host: &str) -> bool {
@@ -453,6 +465,160 @@ pub fn configure_child(command: &mut Command, detach: bool, pdeathsig: bool) {
     }
 }
 
+/// Per-user runtime directory for sockets and one-shot files.
+///
+/// `$XDG_RUNTIME_DIR` is a per-user tmpfs (0700, cleared at logout). Without
+/// it, fall back to the private state directory.
+pub fn runtime_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("NIRUREMOTE_RUNTIME_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Some(base) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+        let ours = fs::metadata(&base).is_ok_and(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            metadata.is_dir() && metadata.uid() == uid()
+        });
+        if ours {
+            return base.join("niruremote");
+        }
+    }
+    state_dir().join("run")
+}
+
+/// Create a file that only the current user can read, failing if it exists.
+pub fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// A random alphanumeric secret from the kernel CSPRNG.
+pub fn random_secret(length: usize) -> Result<String, String> {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+    let mut source =
+        fs::File::open("/dev/urandom").map_err(|error| format!("/dev/urandom: {error}"))?;
+    let mut secret = String::with_capacity(length);
+    let mut byte = [0u8; 1];
+    // Rejection sampling keeps every character equally likely.
+    let limit = 256 - (256 % ALPHABET.len());
+    while secret.len() < length {
+        source
+            .read_exact(&mut byte)
+            .map_err(|error| format!("/dev/urandom: {error}"))?;
+        if usize::from(byte[0]) < limit {
+            secret.push(char::from(ALPHABET[usize::from(byte[0]) % ALPHABET.len()]));
+        }
+    }
+    Ok(secret)
+}
+
+/// Replace terminal control characters in text that came from the network
+/// (Tailscale names, remote agent JSON) before it is printed.
+pub fn sanitize(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+struct TcpEntry {
+    local: (u32, u16),
+    remote: (u32, u16),
+    state: u8,
+    uid: u32,
+}
+
+fn parse_hex_address(text: &str) -> Option<(u32, u16)> {
+    let (address, port) = text.split_once(':')?;
+    if address.len() != 8 {
+        return None;
+    }
+    let address = u32::from_str_radix(address, 16).ok()?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    Some((address, port))
+}
+
+fn parse_proc_tcp(text: &str) -> Vec<TcpEntry> {
+    let mut entries = Vec::new();
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        let (Some(local), Some(remote)) =
+            (parse_hex_address(fields[1]), parse_hex_address(fields[2]))
+        else {
+            continue;
+        };
+        let (Ok(state), Ok(uid)) = (u8::from_str_radix(fields[3], 16), fields[7].parse::<u32>())
+        else {
+            continue;
+        };
+        entries.push(TcpEntry {
+            local,
+            remote,
+            state,
+            uid,
+        });
+    }
+    entries
+}
+
+/// `/proc/net/tcp` stores IPv4 addresses in host byte order.
+const LOOPBACK_HEX: u32 = u32::from_ne_bytes([127, 0, 0, 1]);
+const TCP_LISTEN: u8 = 0x0A;
+
+fn proc_tcp() -> Vec<TcpEntry> {
+    parse_proc_tcp(&fs::read_to_string("/proc/net/tcp").unwrap_or_default())
+}
+
+/// True when something listens on 127.0.0.1:`port`. This reads the kernel
+/// table instead of connecting, so it never counts as a VNC client.
+pub fn tcp_listening_local(port: u16) -> bool {
+    proc_tcp()
+        .iter()
+        .any(|entry| entry.state == TCP_LISTEN && entry.local == (LOOPBACK_HEX, port))
+}
+
+/// The uid that owns the client end of an accepted loopback connection.
+pub fn tcp_peer_uid(peer_port: u16, our_port: u16) -> Option<u32> {
+    proc_tcp()
+        .iter()
+        .find(|entry| {
+            entry.local == (LOOPBACK_HEX, peer_port) && entry.remote == (LOOPBACK_HEX, our_port)
+        })
+        .map(|entry| entry.uid)
+}
+
+/// The uid of the process on the other end of a Unix socket.
+pub fn unix_peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: u32::MAX,
+        gid: u32::MAX,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    (result == 0).then_some(credentials.uid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +648,85 @@ mod tests {
         assert!(human_age(now.saturating_sub(10)).ends_with("s ago"));
         assert!(human_age(now.saturating_sub(120)).ends_with("m ago"));
         assert_eq!(trim_dot("host.example.ts.net."), "host.example.ts.net");
+    }
+
+    #[test]
+    fn proc_net_tcp_is_parsed_in_host_byte_order() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:C350 0100007F:1F90 01 00000000:00000000 00:00000000 00000000    65534        0 2 1 0000000000000000 20 4 30 10 -1
+   2: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 3 1 0000000000000000 100 0 0 10 0
+";
+        let entries = parse_proc_tcp(table);
+        assert_eq!(entries.len(), 3);
+        if cfg!(target_endian = "little") {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.state == TCP_LISTEN && entry.local == (LOOPBACK_HEX, 8080))
+            );
+            let client = entries
+                .iter()
+                .find(|entry| entry.local == (LOOPBACK_HEX, 50000))
+                .unwrap();
+            assert_eq!(client.remote, (LOOPBACK_HEX, 8080));
+            assert_eq!(client.uid, 65534);
+        }
+        assert!(parse_hex_address("zz:1").is_none());
+    }
+
+    #[test]
+    fn real_loopback_listener_is_seen_without_connecting() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(tcp_listening_local(port));
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_server, peer) = listener.accept().unwrap();
+        assert_eq!(tcp_peer_uid(peer.port(), port), Some(uid()));
+        drop(client);
+        drop(listener);
+        assert!(!tcp_listening_local(port));
+    }
+
+    #[test]
+    fn unix_peer_is_the_current_user() {
+        let (left, _right) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(unix_peer_uid(&left), Some(uid()));
+    }
+
+    #[test]
+    fn secrets_are_random_and_alphanumeric() {
+        let first = random_secret(8).unwrap();
+        let second = random_secret(8).unwrap();
+        assert_eq!(first.len(), 8);
+        assert!(
+            first
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn sanitize_strips_terminal_escapes() {
+        assert_eq!(sanitize("host\u{1b}[31mred\n"), "host?[31mred?");
+        assert_eq!(sanitize("desktop · ok"), "desktop · ok");
+    }
+
+    #[test]
+    fn private_files_are_0600_and_exclusive() {
+        let directory =
+            std::env::temp_dir().join(format!("niruremote-test-{}", std::process::id()));
+        ensure_private_dir(&directory).unwrap();
+        let path = directory.join("secret");
+        let _ = fs::remove_file(&path);
+        create_private_file(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(create_private_file(&path).is_err());
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

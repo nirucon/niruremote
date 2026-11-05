@@ -1,8 +1,8 @@
 # Architecture
 
 NIRUREMOTE has two roles in one binary: a **client** that discovers peers and
-opens a viewer, and a **host agent** that exposes the current X11 session on
-loopback. The client never parses a shell transcript; the agent returns
+opens a viewer, and a **host agent** that serves the current X11 session over
+the SSH channel it was started on. The client never parses a shell transcript; the agent returns
 versioned JSON.
 
 ## Module map
@@ -12,10 +12,11 @@ versioned JSON.
 | `main.rs` | Command parsing and help |
 | `tailscale.rs` | `tailscale status --json` discovery and peer model |
 | `client.rs` | Peer cache, parallel probe, state mapping, connect orchestration |
-| `ssh.rs` | Bounded SSH probe, held `ensure` channel, local forward |
-| `agent.rs` | `probe`, `enable`, `disable`, `ensure`, `setup`, `doctor` |
-| `session.rs` | X11 display and Xauthority discovery |
-| `x11vnc.rs` | Backend detection, version, start/stop and package hint |
+| `ssh.rs` | Hardened SSH options, bounded probe, the `stream` command |
+| `agent.rs` | `probe`, `stream` relay + watchdog, `enable`, `disable`, `setup`, `doctor` |
+| `events.rs` | Blocking child-exit and signal events (no polling) |
+| `session.rs` | X11 display, Xauthority and screen-locker discovery |
+| `x11vnc.rs` | Backend detection, `-inetd` and password-listener argument sets |
 | `state.rs` | Runtime state, lock, peer cache paths |
 | `viewer.rs` | TigerVNC/Remmina/FreeRDP detection and launch |
 | `util.rs` | Timeout-bounded process I/O, atomic private writes, signals |
@@ -38,30 +39,31 @@ client
         v
   connect HOST
         |
-        +-- ssh host niruremote ensure --json --hold
-        |         |
-        |         +-- starts/reuses x11vnc on 127.0.0.1
-        |         +-- prints one JSON line, then holds stdin
+        +-- bind private viewer endpoint (Unix socket 0600 in 0700 dir)
+        +-- vncviewer /run/user/UID/niruremote/view-PID.sock
+        +-- accept ONE connection, check peer uid, unlink the socket
         |
-        +-- ssh -N -L 127.0.0.1:LOCAL:127.0.0.1:REMOTE host
-        |
-        +-- vncviewer 127.0.0.1::LOCAL
+        +-- ssh -T ... -- host niruremote stream
+                stdin/stdout = the viewer connection
+                      |
+                      host: niruremote stream
+                            socketpair <-> x11vnc -inetd (no listener)
 ```
 
 ## Process lifetime
 
-- `connect` owns the tunnel child, the held `ensure` child and the viewer child.
-- Every SSH/viewer child gets `PR_SET_PDEATHSIG(SIGTERM)`. If `connect` dies,
-  they die.
-- The remote `ensure` child watches its stdin. When the SSH channel closes, it
-  reads EOF, stops x11vnc and removes state.
-- `enable` starts x11vnc detached with `setsid`; it is intentionally not tied
-  to the terminal. `disable` is the explicit stop.
-- `RemoteSession::drop` closes stdin, sends SIGTERM to the SSH child and reaps
-  it. `Tunnel::drop` does the same for the forward.
-
-This gives two independent cleanup paths: parent-death signals for the local
-SSH/viewer processes, and stdin EOF for the remote agent.
+- `connect` owns the viewer and the SSH child and blocks on an event channel:
+  viewer exit, SSH exit, or a signal (self-pipe). No timer polling.
+- Every SSH/viewer child gets `PR_SET_PDEATHSIG(SIGTERM)`. If `connect` is
+  killed (even with SIGKILL), they die; the SSH channel closes; the remote
+  agent sees EOF and stops x11vnc.
+- The remote `stream` agent relays bytes and ends on EOF, x11vnc exit, a
+  signal, or 30 s without bytes from the viewer (x11vnc `-ping 5` keeps a live
+  viewer talking). That last rule covers a network path that died silently,
+  which sshd may not notice for hours.
+- x11vnc is the agent's child with PDEATHSIG; killing the agent kills it.
+- `enable` starts a detached, password-protected loopback listener; `disable`
+  stops it and ends live `stream` sessions.
 
 ## State
 
@@ -70,6 +72,7 @@ SSH/viewer processes, and stdin EOF for the remote agent.
 | `$XDG_STATE_HOME/niruremote/state.json` | runtime PID, port, display, owner |
 | `$XDG_STATE_HOME/niruremote/x11vnc.log` | private x11vnc log, rotated at 1 MiB |
 | `$XDG_STATE_HOME/niruremote/state.lock` | short-lived operation lock |
+| `$XDG_RUNTIME_DIR/niruremote/` (0700) | viewer sockets, live session records, SSH stderr, transient `enable` password file |
 | `$XDG_CACHE_HOME/niruremote/peers.json` | last probe result per Tailscale node |
 
 `state.json` is written atomically and only after x11vnc has opened its port.
@@ -89,8 +92,9 @@ staleness visible. `peers` without `--refresh` is a local, fast operation;
   new login.
 - SSH is already the suite's remote administration path and is enabled on the
   fleet. Tailscale SSH is not required.
-- Loopback plus `ssh -L` avoids a new tailnet port and avoids VNC's weak
-  authentication becoming an Internet-facing surface.
+- `x11vnc -inetd` over the SSH channel means no port at all: nothing for
+  another local user, the LAN or the tailnet to reach, and VNC's weak
+  authentication is never the boundary for `connect`.
 - A native viewer gives better keyboard handling than a browser and keeps the
   launcher thin.
 
