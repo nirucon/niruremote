@@ -249,6 +249,8 @@ not shipped yet ([ROADMAP.md](ROADMAP.md)).
 
 ## Uninstall
 
+With NIRUX: `nirux extras uninstall niruremote` runs the uninstaller below from the pinned release (add `--purge` to pass it on).
+
 ```sh
 ./uninstall.sh            # remove /usr/local/bin/niruremote and the symlink
 ./uninstall.sh --user     # remove ~/.local/bin/niruremote
