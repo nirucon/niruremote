@@ -1,57 +1,53 @@
 # NIRUREMOTE
 
-**Graphical remote desktop for the [NIRUX](https://github.com/nirucon/nirux) suite, over Tailscale and SSH, by Nicklas Rudolfsson.**
+Graphical remote desktop between your own machines, over Tailscale and SSH, with no open port.
 
-NIRUREMOTE lets you list every machine in your Tailscale tailnet, see whether
-remote desktop is actually installed and ready on it, and open a real graphical
-session without opening any port. Linux/X11 hosts use **x11vnc** attached to
-the existing session, carried **inside the SSH connection itself**: no VNC
-port exists on the host, the client, the LAN or the tailnet. Windows hosts can be opened with RDP and macOS hosts with
-VNC when those services are enabled on the target.
+**Status: alpha** · Part of the [NIRUX](https://github.com/nirucon/nirux) suite · [MIT License](LICENSE)
 
-**Current release: 0.2.0** — a security and reliability release after the
-[0.2 review](docs/REVIEW-0.2.md). The command-line client and agent are
-complete; the NIRULAUNCHER view is the next integration step. Both ends must
-run 0.2.0 or newer: a 0.1.x agent is shown as `update-needed`, and a 0.1.x
-client is told to update.
+## About
 
-## Testing status
+NIRUREMOTE lists every machine in your Tailscale tailnet, shows whether remote
+desktop is actually installed and ready on it, and opens a real graphical
+session. Linux/X11 hosts are served by **x11vnc** attached to the existing
+session and carried **inside the SSH connection itself**: no VNC port exists on
+the host, the client, the LAN or the tailnet. Windows targets open with RDP and
+macOS targets with VNC when those services are enabled on the target.
 
-- **Debian 12** and **Arch Linux**: full headless X11 test passed in disposable
-  containers with a real Xvfb server, real `x11vnc` and the real TigerVNC
-  viewer. Arch was tested with a normal user PATH where `/usr/sbin` is absent.
-- **Void Linux**: package names (`x11vnc`, `tigervnc`, `xorg-server-xvfb`,
-  `xauth`, `freerdp`) were verified against the current void-packages
-  templates. The official Void container image is too old to update xbps, so
-  the full Void runtime test is part of the bare-metal acceptance.
-- **Windows**: RDP client path and firewall/Remote Desktop instructions are
-  documented; a real Windows target test is pending.
-- **macOS**: Screen Sharing/VNC client path and instructions are documented; a
-  real macOS target test is pending.
-- **Bare metal, 0.2.0 (2026-11-05):** real TigerVNC connections over Tailscale
-  between Debian 13 (othala), Arch (algiz) and Void (void) in both directions
-  that apply (othala→void, void→othala, othala→algiz, void→algiz), with
-  `ss` showing no new listener, x11vnc gone after disconnect, `kill -9` of the
-  client and a stalled network path, and NIRULOCK staying locked.
-- **Bare metal is still required.** Run [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)
-  before relying on it for daily access.
-
-## Why this shape
+Why it is built this way:
 
 - **Tailscale is the network.** No relay, account, cloud inbox or public port.
-- **SSH is the control plane.** Remote capability checks use a fixed command
+- **SSH is the control plane.** Remote checks use a fixed command
   (`niruremote probe --json`), never a shell string.
-- **No port at all.** `connect` runs `x11vnc -inetd` on the SSH channel. On the
+- **No port at all.** `connect` runs `x11vnc -inetd` on the SSH channel; on the
   client the viewer uses a private one-shot Unix socket. Nothing listens.
-- **Truthful states.** "Online" is not "ready". NIRUREMOTE distinguishes
-  `ready`, `not-installed`, `update-needed`, `no-session`, `backend-missing`,
-  `host-key-untrusted`, `ssh-denied`, `offline` and `unsupported`, and says
-  when the remote screen is locked.
-- **Temporary by default.** A session lives exactly as long as the SSH
-  channel: closing the viewer, Ctrl+C, killing the client or losing the
-  network ends it. `enable` is only for manual Windows/macOS tunnels.
+- **Truthful states.** "Online" is not "ready"; every peer gets a precise state
+  and NIRUREMOTE says when the remote screen is locked.
+- **Temporary by default.** A session lives exactly as long as the SSH channel.
 
-## Platform support
+Release 0.2.0 was a security and reliability release after the
+[0.2 review](docs/REVIEW-0.2.md). Both ends must run 0.2.0 or newer: a 0.1.x
+agent shows as `update-needed`, and a 0.1.x client is told to update.
+
+## Features
+
+- Peer list from `tailscale status`, with parallel, bounded SSH probes and a
+  private cache.
+- One-command connect to Linux/X11 hosts through TigerVNC over SSH.
+- Windows targets through FreeRDP (`xfreerdp3`, `xfreerdp` or `wlfreerdp`) and
+  macOS targets through TigerVNC.
+- `enable`/`disable`: a password-protected, loopback-only listener for manual
+  SSH tunnels from Windows or macOS clients.
+- Sessions end when the viewer closes, on Ctrl+C, when the client is killed or
+  the network path dies (within 30 s on the host, about 15 s on the client).
+- Desktop notification on the host when a session starts and ends.
+- The lock screen is respected: a viewer of a locked session sees NIRULOCK and
+  needs the account password. NIRUREMOTE never unlocks.
+- Hardened SSH (`BatchMode=yes`, `StrictHostKeyChecking=yes`, no forwarding or
+  connection sharing from user config); x11vnc runs as the logged-in user, never
+  root; Tailscale Funnel is never used. Full threat model in
+  [docs/SECURITY.md](docs/SECURITY.md).
+- `setup` finds and, with `--run`, installs x11vnc and a viewer with a visible
+  sudo/doas prompt.
 
 | Role | Platform | Status in 0.2.0 |
 |---|---|---|
@@ -63,10 +59,19 @@ client is told to update.
 | Host | Wayland | reported as `unsupported-wayland` |
 | Client | Windows / macOS | no NIRUREMOTE build; use the documented SSH tunnel + VNC viewer, or connect to Windows/macOS targets from a Linux client |
 
-The release is a statically linked x86_64 Linux binary. Debian, Arch and Void
-all use the same binary; no Rust installation is required on the target.
+## Requirements
 
-### Package names at a glance
+- **Tailscale** installed and logged in on both ends. NIRUREMOTE only reads the
+  local Tailscale daemon for discovery; it does not change your tailnet.
+- **An OpenSSH server on every Linux host** and **key-based SSH login** from the
+  client; password-only SSH shows `ssh-denied`. Tailscale SSH is not required.
+- **A real X11 session on the host** (NIRUX is X11). A headless server shows
+  `no-session`; NIRUREMOTE does not create a virtual desktop.
+- Host: `x11vnc`, and `niruremote` in a non-interactive SSH `PATH`
+  (`/usr/local/bin`, the default install, works).
+- Client: `ssh`, a TigerVNC viewer, and FreeRDP for Windows targets.
+- x86_64 Linux. The release is a statically linked binary, the same for Debian,
+  Arch and Void; no Rust is needed.
 
 | Distribution | Host backend | VNC viewer | Windows RDP client |
 |---|---|---|---|
@@ -75,326 +80,48 @@ all use the same binary; no Rust installation is required on the target.
 | Void Linux | `x11vnc` | `tigervnc` | `freerdp` |
 | Fedora | `x11vnc` | `tigervnc` | `freerdp` |
 
-`niruremote setup` prints the exact command for the current distribution, and
-`niruremote setup --run` executes it with a visible sudo/doas prompt.
+Per-distribution commands, including SSH server and Tailscale, are in
+[docs/INSTALL-DISTROS.md](docs/INSTALL-DISTROS.md). Testing status per platform
+is in [docs/TESTING-STATUS.md](docs/TESTING-STATUS.md).
 
-### What every setup needs
+## Installation
 
-- **Tailscale** installed and logged in on both ends. NIRUREMOTE uses the local
-  Tailscale daemon only for discovery; it does not change your tailnet.
-- **An SSH server on every Linux host** and **key-based SSH login** from the
-  client. NIRUREMOTE runs `ssh` with `BatchMode=yes`; password-only SSH will
-  show `ssh-denied`, not a hanging prompt.
-- **A VNC viewer on the client** (TigerVNC). For Windows targets, **FreeRDP**.
-- **A real X11 session on the host.** A headless server shows `no-session`;
-  NIRUREMOTE does not create a virtual desktop.
-
-## Requirements
-
-On a Linux machine that will be shared (the host):
-
-- X11 desktop session (NIRUX is X11; Wayland is not supported)
-- `x11vnc`
-- `sshd`, reachable over Tailscale
-- NIRUREMOTE installed in a non-interactive SSH `PATH` (the default
-  `/usr/local/bin` install is recommended)
-
-On the Linux machine you sit at (the client):
-
-- `tailscale` and `ssh`
-- NIRUREMOTE
-- TigerVNC viewer (`vncviewer`) for Linux/macOS targets, and/or FreeRDP
-  (`xfreerdp3`, `xfreerdp` or `wlfreerdp`) for Windows targets
-
-## Install on Debian, Arch and Void
-
-### Debian / Ubuntu
+### With NIRUX
 
 ```sh
-# Host and client:
-sudo apt-get update
-sudo apt-get install -y x11vnc tigervnc-viewer openssh-server
-sudo systemctl enable --now ssh
-
-# Tailscale, if it is not already installed:
-#   install it with the official Tailscale instructions for Debian/Ubuntu,
-#   then: sudo tailscale up
-
-# Optional, only when connecting to Windows targets:
-sudo apt-get install -y freerdp3-x11
-# Debian 12 provides freerdp2-x11 instead; NIRUREMOTE detects xfreerdp.
+nirux extras install niruremote
+niruremote setup --run
+nirux extras update            # later, for the extras you selected
 ```
 
-- `tigervnc-viewer` installs `xtigervncviewer`; NIRUREMOTE detects it.
-- `freerdp3-x11` installs `xfreerdp3`; the older `freerdp2-x11` installs
-  `xfreerdp`.
-- The release binary is static; `./install.sh` does not need Rust.
-
-### Arch Linux
-
-```sh
-sudo pacman -Syu --needed x11vnc tigervnc openssh
-
-# Host: enable the SSH server.
-sudo systemctl enable --now sshd
-
-# Tailscale, if it is not already installed:
-sudo pacman -S --needed tailscale
-sudo systemctl enable --now tailscaled
-sudo tailscale up
-
-# Optional, only when connecting to Windows targets:
-sudo pacman -S --needed freerdp
-```
-
-- `tigervnc` provides the viewer; NIRUREMOTE detects `vncviewer` and
-  `xtigervncviewer`.
-- `freerdp` provides the RDP client.
-
-### Void Linux
-
-```sh
-sudo xbps-install -Syu
-sudo xbps-install -S x11vnc tigervnc openssh
-
-# Host: enable the SSH server under runit (skip if already enabled).
-sudo ln -s /etc/sv/sshd /var/service/ 2>/dev/null || true
-
-# Tailscale, if it is not already installed:
-sudo xbps-install -S tailscale
-sudo ln -s /etc/sv/tailscaled /var/service/ 2>/dev/null || true
-sudo tailscale up
-
-# Optional, only when connecting to Windows targets:
-sudo xbps-install -S freerdp
-```
-
-- Void uses runit. NIRUREMOTE does not install a system service. `niruremote
-  enable` starts a detached user-owned x11vnc until `disable`, logout or
-  reboot.
-- If you use `doas` instead of `sudo`, `install.sh` and `setup --run` fall back
-  to `doas` automatically. If neither is installed, run the printed command as
-  root.
-- `tigervnc` provides the viewer; `x11vnc` provides the host backend.
-- `freerdp` provides the RDP client.
-
-### Install the NIRUREMOTE binary (all three distributions)
+### Standalone
 
 ```sh
 git clone https://github.com/nirucon/niruremote
 cd niruremote
-./install.sh              # verified release binary, or a fresh local build
+./install.sh              # verified release binary into /usr/local/bin (uses sudo or doas)
+./install.sh --user       # into ~/.local/bin instead
+./install.sh --prefix DIR # into DIR
 ./install.sh --build      # force a local cargo build
-./install.sh --user       # install to ~/.local/bin instead of /usr/local/bin
+niruremote setup          # check x11vnc and the viewer
+niruremote setup --run    # install them with a visible sudo/doas prompt
 ```
 
-Release assets are statically linked x86_64 Linux binaries. The default
-install writes `/usr/local/bin/niruremote` and a `~/.local/bin/niruremote`
-symlink for NIRUX extras detection. It uses `sudo` when available and falls back
-to `doas`; `--user` avoids privilege escalation but a non-interactive SSH command
-must then find `niruremote` in its `PATH`. If the target is offline, use
-`./install.sh --build` with Rust or copy the verified binary manually.
+The default install writes `/usr/local/bin/niruremote` and a
+`~/.local/bin/niruremote` symlink so NIRUX can detect it. With `--user`, a
+non-interactive SSH command must still find `niruremote` in its `PATH`. The
+installer installs only the binary: NIRUREMOTE never pipes `curl` into a shell,
+changes Tailscale ACLs, opens a firewall port or installs anything silently.
 
-Then verify the local packages:
+Install it on **every** machine: hosts need the agent, clients the client.
 
-```sh
-niruremote setup
-niruremote setup --run    # visible package command with a sudo prompt
-```
+## Usage
 
-NIRUREMOTE does not pipe `curl` into a shell, does not change Tailscale ACLs,
-does not open a firewall port and does not install anything silently.
-
-### NIRUX extras
-
-The extras row is on `nirux` main and will be part of the next NIRUX release.
-Once your installed `nirux` has the row:
-
-```sh
-nirux extras select niruremote
-nirux extras install niruremote
-niruremote setup --run
-```
-
-Until then, use `./install.sh` from this repository as shown above.
-
-### SSH key access (Linux hosts)
-
-The remote probe and connection are non-interactive. Set up key-based SSH from
-the client to every Linux host **before** using `niruremote peers --refresh`:
-
-```sh
-# On the client, if you do not already have an SSH key:
-ssh-keygen -t ed25519 -C "$USER@$(hostname)"
-
-# Copy the public key to the host:
-ssh-copy-id user@HOST
-
-# Verify that a non-interactive command works:
-ssh HOST niruremote probe --json
-```
-
-Use the **Tailscale DNS name that `niruremote peers` shows** (for example
-`desktop.tailnet.ts.net`) or the Tailscale IPv4 address (`tailscale ip -4`
-on the host). NIRUREMOTE probes that exact host name, so a key trusted only under
-the short name `desktop` still produces `host-key-untrusted` under the FQDN.
-Run `ssh-copy-id` and `ssh` against the FQDN once:
-
-```sh
-ssh-copy-id user@desktop.tailnet.ts.net
-ssh user@desktop.tailnet.ts.net niruremote probe --json
-```
-
-Verify the host-key fingerprint the first time. If `ssh HOST niruremote probe
---json` fails, fix SSH first; NIRUREMOTE will report `host-key-untrusted`,
-`ssh-denied` or `ssh-timeout` rather than prompting.
-
-Tailscale SSH is **not** required or assumed. NIRUREMOTE uses the normal
-OpenSSH server on the Tailscale address.
-
-If your key is passphrase-protected, load it into an agent before using
-NIRUREMOTE. The non-interactive probe uses `BatchMode=yes` and cannot prompt:
-
-```sh
-eval "$(ssh-agent -s)"
-ssh-add ~/.ssh/id_ed25519
-ssh HOST niruremote probe --json
-```
-
-In a NIRUX graphical session, start the agent from the session (or use your
-keyring) so the launcher and terminal inherit `SSH_AUTH_SOCK`.
-
-NIRUREMOTE also looks for a working agent itself: it checks the current
-`SSH_AUTH_SOCK`, then `gcr/ssh`, `openssh_agent`, `keyring/ssh` and `ssh-agent`,
-and uses the first socket that actually has identities. This handles the common
-NIRUX/GNOME Keyring case where the session points at an empty
-`/run/user/UID/openssh_agent` while the unlocked key is in
-`/run/user/UID/gcr/ssh`.
-
-## Windows target (RDP)
-
-NIRUREMOTE connects **to** Windows; it does not enable or configure Windows.
-Do this on the Windows machine:
-
-1. Install Tailscale for Windows and sign in. Note the machine name and
-   Tailscale IPv4 address (`tailscale ip -4` in PowerShell).
-2. Open **Settings → System → Remote Desktop** and turn **Remote Desktop** on.
-   Add the account you will use. Keep **Require devices to use Network Level
-   Authentication** enabled.
-3. Allow Remote Desktop through Windows Defender Firewall. If the Tailscale
-   adapter is on a Private profile, the standard **Remote Desktop - User Mode
-   (TCP-In)** rule normally applies. If it does not, allow that rule for the
-   Private profile. Never forward 3389 from your router.
-4. On the Linux client, install FreeRDP (see the Debian/Arch/Void commands
-   above).
-5. On the Linux client:
-
-   ```sh
-   niruremote peers --refresh
-   niruremote connect winhost
-   ```
-
-   The peer should show `client-ready` when port 3389 is reachable and a local
-   RDP client exists. `client-ready` only checks reachability and the local
-   client; it does not validate your Windows password. FreeRDP will prompt for
-   the account and password.
-6. FreeRDP 3 (`xfreerdp3`) uses `/cert:tofu` on first use. FreeRDP 2
-   (`xfreerdp`) keeps its own certificate prompt. If the Windows peer shows
-   `unreachable`, check:
-
-   ```powershell
-   tailscale status
-   Test-NetConnection <tailscale-ip> -Port 3389
-   ```
-
-   Also confirm Remote Desktop is on and the firewall rule applies to the
-   Tailscale profile.
-7. Windows Home editions do not provide the RDP **host** service. Use a
-   Pro/Enterprise edition, or a different remote-access product. NIRUREMOTE
-   cannot add an RDP server to Windows Home.
-
-## macOS target (VNC / Screen Sharing)
-
-NIRUREMOTE connects **to** macOS; it does not enable or configure macOS.
-
-1. Install Tailscale for macOS and sign in. Note the machine name and Tailscale
-   IPv4 address.
-2. Open **System Settings → General → Sharing → Screen Sharing** and turn it
-   on. Open the information panel, enable **VNC viewers may control screen with
-   password**, and set a strong VNC password. Allow the macOS user account that
-   may share the screen.
-3. Allow Screen Sharing in the macOS firewall (System Settings → Network →
-   Firewall → Options). Never forward 5900 from your router.
-4. On the Linux client, install TigerVNC (see the Debian/Arch/Void commands
-   above).
-5. On the Linux client:
-
-   ```sh
-   niruremote peers --refresh
-   niruremote connect machost
-   ```
-
-   The peer should show `client-ready` when port 5900 is reachable and a local
-   VNC viewer exists. macOS may ask for the VNC password and/or the allowed
-   macOS account.
-6. If the peer shows `unreachable`, check Screen Sharing, the firewall and:
-
-   ```sh
-   nc -vz <tailscale-ip> 5900
-   ```
-
-   NIRUREMOTE never enables Screen Sharing or changes the macOS firewall.
-
-## Connecting from Windows or macOS to a NIRUX host
-
-NIRUREMOTE is a Linux client. To reach a NIRUX/Linux host from a Windows or
-macOS machine, use the standard SSH client plus a VNC viewer against the
-`enable` listener, which is loopback-only and password-protected.
-
-On the NIRUX host:
-
-```sh
-niruremote enable
-niruremote probe --json
-```
-
-`enable` prints the port (for example `43123`) and a one-time VNC password.
-The listener is `127.0.0.1` only; the SSH tunnel is the only ingress, and the
-viewer must also give the password. Run `niruremote disable` when done.
-
-On Windows (PowerShell with OpenSSH) or macOS (Terminal), create a local tunnel
-and keep it open:
-
-```sh
-ssh -N -L 5900:127.0.0.1:<REMOTE_PORT> user@desktop
-```
-
-For example, if the host reported `43123`:
-
-```sh
-ssh -N -L 5900:127.0.0.1:43123 user@desktop
-```
-
-Then connect a VNC viewer to `127.0.0.1:5900`:
-
-- Windows: TigerVNC Viewer for Windows, RealVNC Viewer, or another VNC client.
-- macOS: TigerVNC Viewer, or the built-in Screen Sharing client with
-  `vnc://127.0.0.1:5900`.
-
-Use the actual port that `enable` printed, not a hardcoded remote port. The
-viewer asks for the VNC password. The local `5900` only needs to be free on the
-Windows/macOS client. Verify the SSH host key fingerprint before accepting it.
-Linux clients do not need any of this: `niruremote connect` opens no port.
-
-## Quick start
-
-On the host (the machine you want to reach):
+On the host (the machine you want to reach), nothing has to run:
 
 ```sh
 niruremote probe            # is there an X11 session? is x11vnc installed?
 ```
-
-Nothing else is needed on the host: no service, no open port.
 
 On the client (the machine you sit at):
 
@@ -403,21 +130,13 @@ niruremote peers --refresh  # Tailscale machines + verified readiness
 niruremote connect desktop
 ```
 
-`connect` will:
+`connect` checks the remote agent and X11 session over SSH, opens the VNC viewer
+on a private one-shot Unix socket, runs `ssh HOST niruremote stream` (which
+starts `x11vnc -inetd` on the SSH channel) and ends everything when the session
+ends. You do not need `enable` for `connect`. Details:
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-1. check the remote agent and X11 session over SSH (and tell you if the
-   screen is locked);
-2. open the VNC viewer on a private one-shot Unix socket;
-3. run `ssh HOST niruremote stream`, which starts `x11vnc -inetd` on the SSH
-   channel — the viewer's connection *is* the SSH channel's stdin/stdout;
-4. end everything when the viewer closes, you press Ctrl+C, the client is
-   killed, or the network path dies (within 30 s on the host, ~15 s on the
-   client).
-
-You do **not** need `enable` for `connect`. The host shows a desktop
-notification when a session starts and ends.
-
-## Commands
+### Commands
 
 ```text
 niruremote probe [--json]              inspect the local agent
@@ -437,7 +156,7 @@ niruremote version
 `--timeout` bounds the SSH probe (1–30 seconds, default 3). `--print` shows the
 planned SSH/VNC/RDP path without starting a session.
 
-## Peer states
+### Peer states
 
 | State | Meaning |
 |---|---|
@@ -456,81 +175,44 @@ planned SSH/VNC/RDP path without starting a session.
 | `unsupported` | Mobile/other peer, not a desktop host |
 
 The detail column adds `screen locked (nirulock)`, active sessions and an
-enabled manual-tunnel listener when they apply. The cache lives in `~/.cache/niruremote/peers.json`. Without `--refresh` the
-client reads the cache; with `--refresh` it probes online peers in parallel and
-updates the cache. Offline peers are never probed.
+enabled manual-tunnel listener when they apply. Without `--refresh`, `peers`
+reads the cache; with `--refresh` it probes online peers in parallel. Offline
+peers are never probed.
 
-## Linux/X11 connection
+### Windows and macOS
 
-```text
-client                                       host
-  ssh host niruremote probe --json  ------->  (read-only)
-  vncviewer /run/user/UID/niruremote/view-PID.sock
-     | accepted once (same uid), socket unlinked
-  ssh -T ... -- host niruremote stream ----->  niruremote stream
-     stdin/stdout = viewer connection            socketpair <-> x11vnc -inetd
+Windows (RDP) and macOS (Screen Sharing/VNC) are supported as **targets** when
+their own remote service is enabled; NIRUREMOTE never configures them. Connecting
+**from** Windows or macOS to a NIRUX host uses `niruremote enable` and an SSH
+tunnel. Step-by-step setup for all of this is in
+[docs/WINDOWS-MACOS.md](docs/WINDOWS-MACOS.md).
+
+## Configuration
+
+There is no configuration file. What matters is SSH: set up key-based login from
+the client to every Linux host, against the Tailscale DNS name that
+`niruremote peers` shows, and verify the host key once in a terminal:
+
+```sh
+ssh-copy-id user@desktop.tailnet.ts.net
+ssh user@desktop.tailnet.ts.net niruremote probe --json
 ```
 
-There is no `ssh -L` and no listening socket. The agent relays the SSH channel
-to x11vnc and ends the session on EOF, on a signal, when x11vnc exits, or after
-30 s without traffic from the viewer (x11vnc pings every 5 s). The client's
-SSH and viewer children have `PR_SET_PDEATHSIG`, so a killed client closes the
-channel and the host stops x11vnc immediately.
+A passphrase-protected key must be loaded in an agent. NIRUREMOTE looks for a
+working one itself (`SSH_AUTH_SOCK`, then `gcr/ssh`, `openssh_agent`,
+`keyring/ssh` and `ssh-agent`). The full guide is in [docs/SSH.md](docs/SSH.md).
 
-## Windows and macOS: what NIRUREMOTE does
+## Files and paths
 
-The detailed setup is in **Windows target (RDP)** and **macOS target (VNC /
-Screen Sharing)** above. In short:
+| Path | Purpose |
+|---|---|
+| `/usr/local/bin/niruremote` | Program (default install) |
+| `~/.local/bin/niruremote` | Symlink for NIRUX, or the program with `--user` |
+| `${XDG_CACHE_HOME:-~/.cache}/niruremote/peers.json` | Peer cache |
+| `${XDG_STATE_HOME:-~/.local/state}/niruremote/` | State (`enable` listener, sessions) |
+| `$XDG_RUNTIME_DIR/niruremote/` | Viewer sockets and session records |
 
-- **Windows**: checks TCP 3389 over Tailscale and starts `xfreerdp3`,
-  `xfreerdp` or `wlfreerdp` with `/dynamic-resolution` and clipboard. FreeRDP 3
-  uses `/cert:tofu`; FreeRDP 2 keeps its own certificate prompt. Enable Remote
-  Desktop on Windows first.
-- **macOS**: checks TCP 5900 and starts TigerVNC against the host. Enable
-  Screen Sharing and the VNC password in macOS first.
-
-NIRUREMOTE does not remotely enable RDP, change Windows firewall rules or turn
-on macOS Screen Sharing. Those are OS-level administration actions with their
-own security model. The state shows `client-ready` when the port is reachable
-and a local client is installed.
-
-## Security model
-
-- x11vnc runs as the logged-in user, never as root.
-- `connect` opens no port anywhere. The SSH login (key, verified host key) is
-  the authentication; the viewer endpoint on the client is a one-shot Unix
-  socket checked for the same uid.
-- `enable` is a `127.0.0.1`-only listener with a random per-enable VNC
-  password, given to x11vnc through a 0600 file it deletes, never via argv.
-- SSH uses `BatchMode=yes`, `StrictHostKeyChecking=yes`, a short
-  `ConnectTimeout`, and clears forwardings, agent/X11 forwarding and
-  connection sharing from user config. Unknown or changed host keys fail
-  closed; verify them in a terminal first.
-- The remote commands are fixed (`niruremote probe --json`,
-  `niruremote stream`); host names are validated and passed after `--`.
-- The agent attaches only to the current user's X11 session, never to another
-  user or a login greeter.
-- The lock screen is respected. A remote viewer of a locked session sees
-  NIRULOCK; only the account password unlocks it. NIRUREMOTE never unlocks.
-- The host gets a desktop notification when a session starts and ends;
-  `niruremote disable` ends every session.
-- Tailscale Funnel is never used. No public endpoint is created.
-- State and cache files are private (`0700` directories, `0600` files).
-- `setup --run` shows the package command and inherits the terminal, so sudo
-  can prompt. No password is captured or logged.
-
-See [docs/SECURITY.md](docs/SECURITY.md) for the full threat model.
-
-## NIRUX and NIRULAUNCHER integration
-
-The intended UI is the existing Tailscale view in NIRULAUNCHER: every machine,
-OS, online state and a verified badge, with contextual **Connect**, **Allow
-connections**, **Stop allowing**, **Install**, **Check again** and **Details**
-actions. The CLI already returns the machine-readable data that view needs.
-
-The exact integration plan, JSON fields and refresh strategy are in
-[docs/LAUNCHER.md](docs/LAUNCHER.md). The NIRUX extras row is already on
-`nirux` main; the remaining launcher work is tracked in [ROADMAP.md](ROADMAP.md).
+Directories are `0700`, files `0600`.
 
 ## Troubleshooting
 
@@ -540,28 +222,51 @@ niruremote probe --json
 niruremote peers --refresh --timeout 5
 ```
 
-- **`no-session`**: the machine is headless or nobody is logged in to an X11
-  desktop. Log in at the machine first; headless servers do not get a virtual
-  desktop.
+- **`no-session`**: nobody is logged in to an X11 desktop on the host. Log in at
+  the machine first.
 - **`backend-missing`**: install `x11vnc` on the host.
 - **`host-key-untrusted`**: run `ssh HOST` once in a terminal and verify the
-  fingerprint. NIRUREMOTE will not accept a new key automatically.
-- **`ssh-denied`**: unlock the SSH key or add it to the remote
-  `authorized_keys`.
-- **`update-needed`**: the host runs NIRUREMOTE 0.1.x. Update it there
-  (`nirux extras update`, or `./install.sh`).
-- **Locked screen**: you see NIRULOCK; type the account password in the viewer
-  to unlock, exactly as at the machine.
+  fingerprint. NIRUREMOTE never accepts a new key automatically.
+- **`ssh-denied`**: unlock the SSH key or add it to the remote `authorized_keys`.
 - **`not-installed`**: install NIRUREMOTE in `/usr/local/bin` on the host so a
   non-interactive SSH command can find it.
-- **Viewer missing**: install `tigervnc-viewer` (Debian/Ubuntu) or `tigervnc`
+- **`update-needed`**: the host runs 0.1.x; update it there
+  (`nirux extras update` or `./install.sh`).
+- **Locked screen**: you see NIRULOCK; type the account password in the viewer,
+  exactly as at the machine.
+- **Viewer missing**: install `tigervnc-viewer` (Debian) or `tigervnc`
   (Arch/Void) on the client.
-- **Black screen**: the host display may be DPMS-off, the lid may be closed, or
-  the X session may be on another VT. Wake the display and try again.
-- **RDP/VNC target unreachable**: enable Remote Desktop (Windows) or Screen
-  Sharing (macOS), and confirm the tailnet ACL allows the port.
+- **Black screen**: the host display may be off, the lid closed or the session
+  on another VT. Wake the display and try again.
+- **RDP/VNC target unreachable**: see [docs/WINDOWS-MACOS.md](docs/WINDOWS-MACOS.md).
 
-Environment overrides used by the test suite and for debugging:
+Known limits in 0.2.0: Linux/X11 hosts only (Wayland is reported, not
+supported); `enable` does not survive logout or reboot; no audio, file transfer,
+printer/USB redirection or monitor picker (use NIRUSHARE for files); an active
+session costs about 1.5 % of one core for x11vnc's polling, nothing when idle;
+the NIRU Launcher view is specified in [docs/LAUNCHER.md](docs/LAUNCHER.md) but
+not shipped yet ([ROADMAP.md](ROADMAP.md)).
+
+## Uninstall
+
+```sh
+./uninstall.sh            # remove /usr/local/bin/niruremote and the symlink
+./uninstall.sh --user     # remove ~/.local/bin/niruremote
+./uninstall.sh --purge    # also remove the state and cache directories
+```
+
+## Building from source
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build --release --locked
+./tests/smoke-local.sh    # full Linux path with fake x11vnc, SSH and viewer
+```
+
+`rust-version` is 1.85 (Debian 13's rustc); CI builds and tests on it.
+Environment overrides for tests and debugging:
 
 ```text
 NIRUREMOTE_STATE_DIR   state directory
@@ -577,37 +282,39 @@ NIRUREMOTE_IDLE_SECS   dead-path watchdog, 2-600 s (default 30)
 NIRUREMOTE_NOTIFY=off  no desktop notifications from `stream`
 ```
 
-## Development
+More: [specification](SPECIFICATION.md), [security policy](SECURITY.md),
+[release checklist](docs/RELEASE.md), [acceptance](docs/ACCEPTANCE.md),
+[changelog](CHANGELOG.md).
 
-```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo build --release --locked
-```
+## Status, disclaimer and how it's made
 
-`rust-version` is 1.85 (Debian 13's rustc); CI builds and tests on it.
-The local smoke test uses a fake x11vnc, a fake SSH and a fake viewer so the
-full Linux path (including the dead-path watchdog and `kill -9`) can be
-exercised without an X server:
+**Status: alpha.** Linux-to-Linux sessions over Tailscale are tested on real Debian, Arch and Void machines; Windows and macOS targets are documented but not yet tested against real machines, and the launcher integration is still to come.
 
-```sh
-./tests/smoke-local.sh
-```
+NIRUX and every niru* project are made by me, Nicklas Rudolfsson
+([@nirucon](https://github.com/nirucon)), for me. They are tailored to my own
+needs, preferences and workflows, on my own machines. If they fit yours too,
+that's a nice bonus.
 
-## Limits in 0.2.0
+- **Free and open source.** Anyone is free to use, study, change and share
+  it under the [MIT License](LICENSE).
+- **No guarantees.** There is no warranty of any kind. Use it at your own
+  risk, read what you install and keep backups of anything that matters.
+- **How it's made.** Some of these projects I built from scratch by hand. In
+  more recent releases I have used Claude, Anthropic's AI, to do much of the
+  heavy lifting under my direction: I decide what to build and how it should
+  behave, and I test it on my own machines. It saves me a lot of time, and
+  the result is quite OK.
+- **Alpha, beta, dev, and maybe forever.** Most things here are alpha, beta
+  or dev, and may stay that way. Maybe one day there will be a real stable
+  release, but given how fast development moves, and how I am as a person,
+  maybe never :)
 
-- Linux/X11 only for hosts. Wayland is reported, not supported.
-- `enable` does not survive a reboot or logout.
-- No audio, file transfer, printer/USB redirection or multi-monitor picker.
-  Use NIRUSHARE for files.
-- An active session costs what x11vnc's screen polling costs (about 1.5 % of
-  one core and ~600 wakeups/s measured on a laptop); nothing runs when no
-  session is open.
-- Windows/macOS are targets only when their own remote service is already
-  enabled. No remote OS configuration.
-- NIRULAUNCHER/NIRUBAR integration is specified but not shipped.
+| Label | Meaning |
+|---|---|
+| dev | Under active construction; may not build, install or work yet. |
+| alpha | Works on my machines, but incomplete or rough; expect breaking changes. |
+| beta | In daily use on my machines and mostly complete; rough edges remain. |
 
 ## License
 
-MIT. Copyright 2026 Nicklas Rudolfsson.
+MIT License, see [LICENSE](LICENSE). Copyright (c) 2026 Nicklas Rudolfsson.
